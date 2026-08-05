@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
 find_package(CUDAToolkit)
 
+if (NOT DEFINED GGML_CUDA_BACKEND_TARGET)
+    set(GGML_CUDA_BACKEND_TARGET ggml-cuda)
+endif()
+
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
 
@@ -115,10 +119,15 @@ if (CUDAToolkit_FOUND)
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
-    ggml_add_backend_library(ggml-cuda
+    ggml_add_backend_library(${GGML_CUDA_BACKEND_TARGET}
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (GGML_CUDA_VENDOR_MACA)
+        message(STATUS "Building ${GGML_CUDA_BACKEND_TARGET} through MACA cu-bridge")
+        target_compile_definitions(${GGML_CUDA_BACKEND_TARGET} PRIVATE GGML_USE_MACA)
+    endif()
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
@@ -147,35 +156,35 @@ if (CUDAToolkit_FOUND)
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
-            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas)
+            target_link_libraries(${GGML_CUDA_BACKEND_TARGET} PRIVATE CUDA::cudart_static CUDA::cublas)
         else ()
             if (GGML_CUDA_CUB_3DOT2)
-                target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
+                target_link_libraries(${GGML_CUDA_BACKEND_TARGET} PRIVATE CCCL::CCCL)
             endif()
             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "10.1")
-                target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static)
+                target_link_libraries(${GGML_CUDA_BACKEND_TARGET} PRIVATE CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static)
             else()
-                target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static)
+                target_link_libraries(${GGML_CUDA_BACKEND_TARGET} PRIVATE CUDA::cudart_static CUDA::cublas_static)
             endif()
         endif()
     else()
         if (GGML_CUDA_CUB_3DOT2)
-            target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
+            target_link_libraries(${GGML_CUDA_BACKEND_TARGET} PRIVATE CCCL::CCCL)
         endif()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
+        target_link_libraries(${GGML_CUDA_BACKEND_TARGET} PRIVATE CUDA::cudart CUDA::cublas)
     endif()
 
     if (GGML_CUDA_NO_VMM)
         # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
     else()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
+        target_link_libraries(${GGML_CUDA_BACKEND_TARGET} PRIVATE CUDA::cuda_driver)
     endif()
 
     if (GGML_CUDA_NCCL)
         find_package(NCCL)
         if (NCCL_FOUND)
             add_compile_definitions(GGML_USE_NCCL)
-            target_link_libraries(ggml-cuda PRIVATE NCCL::NCCL)
+            target_link_libraries(${GGML_CUDA_BACKEND_TARGET} PRIVATE NCCL::NCCL)
         else()
             message(STATUS "Warning: NCCL not found, performance for multiple CUDA GPUs will be suboptimal")
         endif()
@@ -232,9 +241,14 @@ if (CUDAToolkit_FOUND)
             string(REGEX REPLACE "^.* version ([0-9.]*).*$" "\\1" CUDA_CCVER ${CUDA_CCFULLVER})
         endif()
 
+        # CUDA-compatible wrappers may not forward nvcc's host version query.
+        if (CUDA_CCVER STREQUAL "")
+            set(CUDA_CCVER "${CMAKE_CXX_COMPILER_VERSION}")
+        endif()
+
         message(STATUS "CUDA host compiler is ${CUDA_CCID} ${CUDA_CCVER}")
 
-        ggml_get_flags(${CUDA_CCID} ${CUDA_CCVER})
+        ggml_get_flags("${CUDA_CCID}" "${CUDA_CCVER}")
         list(APPEND CUDA_CXX_FLAGS ${CXX_FLAGS} ${GF_CXX_FLAGS})  # This is passed to -Xcompiler later
     endif()
 
@@ -252,7 +266,7 @@ if (CUDAToolkit_FOUND)
         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
     endif()
 
-    target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+    target_compile_options(${GGML_CUDA_BACKEND_TARGET} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()

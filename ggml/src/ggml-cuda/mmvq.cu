@@ -37,6 +37,15 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+static constexpr __host__ __device__ int ggml_cuda_mmvq_physical_warp_size() {
+#if defined(GGML_USE_MACA)
+    // cu-bridge exposes MMVQ subgroup operations as logical 32-lane warps.
+    return 32;
+#else
+    return ggml_cuda_get_physical_warp_size();
+#endif
+}
+
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
@@ -283,6 +292,13 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+#if defined(GGML_USE_MACA)
+    // Do not select the NVIDIA-oriented MUL_MAT_ID kernel from the virtual CC.
+    GGML_UNUSED(type);
+    GGML_UNUSED(cc);
+    return 0;
+#endif
+
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -316,6 +332,11 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+#if defined(GGML_USE_MACA)
+    GGML_UNUSED(cc);
+    return (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0) && ne11 == 1;
+#endif
+
     if (!ggml_is_quantized(type)) {
         return false;
     }
@@ -434,6 +455,12 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+#if defined(GGML_USE_MACA)
+    // Eight logical warps cover the common K=2048 Q8_0 decode shape in one pass.
+    if (type == GGML_TYPE_Q8_0 && ncols_dst == 1) {
+        return 8;
+    }
+#endif
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -581,7 +608,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_mmvq_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -600,7 +627,7 @@ static __global__ void mul_mat_vec_q(
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int warp_size = ggml_cuda_mmvq_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
@@ -833,7 +860,7 @@ static __global__ void mul_mat_vec_q(
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
-__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_mmvq_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_ptr,
@@ -849,7 +876,7 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int warp_size = ggml_cuda_mmvq_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
@@ -1075,7 +1102,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     const int device = ggml_cuda_get_device();
     const int                     cc        = ggml_cuda_info().devices[device].cc;
+#if defined(GGML_USE_MACA)
+    const int warp_size = ggml_cuda_mmvq_physical_warp_size();
+#else
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
+#endif
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
     const bool has_ids = ids != nullptr;
@@ -1088,6 +1119,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const int     blocks_per_iter_1warp = vdr * warp_size / qi;
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
+#if defined(GGML_USE_MACA)
+        // Keep the regular launch unless a validated MACA shape is selected below.
+        GGML_UNUSED(c_ncols_dst);
+        return false;
+#endif
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
@@ -1180,7 +1216,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             };
 
-            if (should_use_small_k(c_ncols_dst)) {
+            bool use_small_k = should_use_small_k(c_ncols_dst);
+#if defined(GGML_USE_MACA)
+            // RPB8 improves the validated K=2048 Q8_0 projections but regresses smaller shapes.
+            if constexpr (type == GGML_TYPE_Q8_0) {
+                if (!has_ids && ncols_x == 2048 && nrows_x >= 2048) {
+                    use_small_k = true;
+                }
+            }
+#endif
+            if (use_small_k) {
                 launch(std::true_type{},  std::false_type{});
             } else if (should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
