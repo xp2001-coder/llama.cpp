@@ -54,7 +54,7 @@ Validated configurations include:
 - Llama-3.2-3B-Instruct in F16 and Q8_0
 - Q8_0 prefill through dequantization plus mcBLAS
 - Q8_0 single-token decode through logical-warp32 MMVQ plus MACA `sdot4`
-- CUDA-compatible graph capture and replay
+- optional CUDA-compatible graph capture and replay (`-DGGML_MACA_GRAPHS=ON`); disabled by default while graph-update fallback is being hardened
 - Interactive and OpenAI-compatible HTTP inference, including UTF-8 prompts
 
 ## Current feature policy
