@@ -60,7 +60,8 @@ placeholder. The actual device target is selected by `CUCC_TARGETS` or
 | --- | --- | --- |
 | `MACA_PATH` | `/opt/maca` | MACA SDK root |
 | `MACA_CU_BRIDGE` | `$MACA_PATH/tools/cu-bridge` | Compatibility bridge root |
-| `MACA_VIRTUAL_ROOT` | `$HOME/cu-bridge` | Virtual CUDA toolchain root |
+| `CUBRIDGE_HOME` | `$HOME` | Parent directory for the SDK virtual toolchain; `WCUDA_HOME` takes precedence |
+| `MACA_VIRTUAL_ROOT` | `$CUBRIDGE_HOME/cu-bridge` | Must match the SDK virtual toolchain layout |
 | `MACA_BUILD_DIR` | `build-maca` | CMake build directory |
 | `MACA_BUILD_JOBS` | `8` | Parallel jobs for host targets |
 | `CUCC_TARGETS` | unset | Explicit multi-target architecture list |
@@ -81,8 +82,9 @@ Run the Q8_0 matrix multiplication coverage and a model benchmark:
 scripts/maca/validate.sh /path/to/model-q8_0.gguf
 ```
 
-Validation artifacts are written to
-`${MACA_TEST_OUTPUT:-${TMPDIR:-/tmp}/llama-maca-validation}`.
+Validation artifacts are written to a separate directory for each run under
+`${MACA_TEST_OUTPUT:-$MACA_BUILD_DIR/validation}`. Operator coverage is limited
+to Q8_0 x F32 MUL_MAT; the benchmark uses the supplied model and `MACA_DEVICE`.
 
 Individual backend operation coverage can also be run directly:
 
@@ -103,7 +105,6 @@ Interactive inference:
   -m /path/to/model.gguf \
   -ngl 99 \
   -c 4096 \
-  -cnv \
   --simple-io
 ```
 
@@ -134,8 +135,8 @@ synchronization overhead can exceed the compute saved on each device.
 
 ## Validation matrix
 
-The following configurations have model-level correctness, benchmark, and
-interactive or HTTP inference coverage:
+The following configurations record validation before the optimization branch
+was rebased. They must be retested for the current revision:
 
 | Hardware | Model | Formats | Coverage |
 | --- | --- | --- | --- |

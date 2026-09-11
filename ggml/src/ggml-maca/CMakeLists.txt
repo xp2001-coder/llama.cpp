@@ -8,7 +8,10 @@ if (MACA_PATH STREQUAL "")
     endif()
 endif()
 
-set(MACA_CU_BRIDGE "${MACA_PATH}/tools/cu-bridge")
+set(MACA_CU_BRIDGE "$ENV{MACA_CU_BRIDGE}" CACHE PATH "Path to MACA cu-bridge")
+if (MACA_CU_BRIDGE STREQUAL "")
+    set(MACA_CU_BRIDGE "${MACA_PATH}/tools/cu-bridge")
+endif()
 if (NOT EXISTS "${MACA_CU_BRIDGE}")
     message(FATAL_ERROR "MACA cu-bridge was not found at ${MACA_CU_BRIDGE}")
 endif()
@@ -38,18 +41,8 @@ list(APPEND GGML_SOURCES_MACA ${SRCS})
 file(GLOB SRCS "../ggml-cuda/template-instances/mmf*.cu")
 list(APPEND GGML_SOURCES_MACA ${SRCS})
 
-if (GGML_CUDA_FA_ALL_QUANTS)
-    file(GLOB SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
-    list(APPEND GGML_SOURCES_MACA ${SRCS})
-    add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-else()
-    list(APPEND GGML_SOURCES_MACA
-        ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
-    )
-endif()
+ggml_cuda_fattn_vec_instances("${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda" SRCS)
+list(APPEND GGML_SOURCES_MACA ${SRCS})
 
 ggml_add_backend_library(ggml-maca
     ${GGML_HEADERS_MACA}
@@ -57,7 +50,6 @@ ggml_add_backend_library(ggml-maca
 )
 
 target_compile_definitions(ggml-maca PRIVATE GGML_USE_MACA)
-add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
 add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
 add_compile_definitions(GGML_CUDA_NO_FA)
