@@ -21,6 +21,16 @@ The initial implementation uses these matrix multiplication routes:
 | Q4_0 single-token decode | shared MMVQ compatibility path |
 | Unvalidated fused or indexed quantized operations | conservative fallback |
 
+## Kernel subgroup width
+
+MACA uses logical 32-lane groups for the shared CUDA kernels. The MACA vendor policy supplies this width both to device initialization and to the compile-time kernel helper. Host launch dimensions, lane indexing, reductions, and shared-memory layouts must use the same logical width.
+
+The device record keeps the runtime value in `reported_warp_size`; `warp_size` is the logical width used by shared kernels. Initialization logs both values when they differ. The existing upstream helper name `ggml_cuda_get_physical_warp_size()` is retained, but on MACA it returns the logical kernel width, not the runtime-reported hardware width.
+
+This also applies to GATED_DELTA_NET, FWHT, and MoE indexing helpers, rather than only MMVQ. Q4_0/Q8_0 dispatch, `sdot4`, and the existing MMVQ tuning are unchanged. Logical width does not set the total thread count per block. Any future native-width kernel must define and validate its own launch, shuffle, synchronization, and memory layout together.
+
+The unified policy requires hardware regression testing after a change; it does not establish correctness or a performance improvement by itself.
+
 ## Requirements
 
 - A MetaX GPU with a compatible driver

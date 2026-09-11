@@ -11,7 +11,8 @@ struct ggml_maca_policy {
     static constexpr bool supports_mmvq_fusion = false;
     static constexpr bool supports_transposed_mmvf = false;
 
-    static constexpr __host__ __device__ int mmvq_warp_size(int) {
+    // CUDA-compatible kernels use logical 32-lane groups on MACA.
+    static constexpr __host__ __device__ int kernel_warp_size(int) {
         return 32;
     }
 
