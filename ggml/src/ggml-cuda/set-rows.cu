@@ -1,4 +1,7 @@
 #include "set-rows.cuh"
+#if defined(GGML_USE_MACA)
+#include "ggml-maca/copy.cuh"
+#endif
 #include "cpy-utils.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
@@ -377,6 +380,15 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+#if defined(GGML_USE_MACA)
+    ggml_cuda_pool_alloc<char> storage(ctx.pool());
+    ggml_tensor packed;
+    if (src0->type == GGML_TYPE_F16 && dst->type != GGML_TYPE_F16 &&
+        (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_BF16 || ggml_maca_can_quantize(dst->type))) {
+        packed = ggml_maca_copy_f32(ctx, src0, storage);
+        src0 = &packed;
+    }
+#endif
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 

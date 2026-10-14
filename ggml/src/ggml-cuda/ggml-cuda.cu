@@ -72,6 +72,11 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
+#if defined(GGML_USE_MACA)
+#include "ggml-maca/blas.cuh"
+#include "ggml-maca/copy.cuh"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -354,9 +359,14 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
 
+#if defined(GGML_USE_MACA)
+        info.devices[id].warp_size = ggml_maca_kernel_warp_size();
+        info.devices[id].supports_cooperative_launch = false;
+#else
         int supports_coop_launch = 0;
         CUDA_CHECK(cudaDeviceGetAttribute(&supports_coop_launch, cudaDevAttrCooperativeLaunch, physical_id));
         info.devices[id].supports_cooperative_launch = !!supports_coop_launch;
+#endif
 
 #if defined(GGML_USE_HIP)
         info.devices[id].smpbo = prop.sharedMemPerBlock;
@@ -376,6 +386,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       id, prop.name, prop.gcnArchName, info.devices[id].cc & 0xffff,
                       device_vmm ? "yes" : "no", prop.warpSize,
                       device_vram_mib);
+#elif defined(GGML_USE_MACA)
+        info.devices[id].smpbo = prop.sharedMemPerBlock;
+        info.devices[id].cc = GGML_CUDA_CC_OFFSET_METAX;
+        GGML_LOG_INFO("  Device %d: %s, reported warp: %d, kernel subgroup: %d, VRAM: %zu MiB\n",
+                      id, prop.name, prop.warpSize, info.devices[id].warp_size, device_vram_mib);
 #elif defined(GGML_USE_MUSA)
         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
         info.devices[id].cc = GGML_CUDA_CC_OFFSET_MTHREADS + prop.major * 0x100;
@@ -1460,6 +1475,16 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
 
+#if defined(GGML_USE_MACA)
+    ggml_cuda_pool_alloc<char> packed_storage(ctx.pool());
+    ggml_tensor packed_src0;
+    if (ggml_is_quantized(src0->type) && !ggml_is_contiguously_allocated(src0) && !traits::convert_nc(src0->type)) {
+        GGML_ASSERT(traits::convert(src0->type) != nullptr);
+        packed_src0 = ggml_maca_pack_quantized_rows(ctx, src0, packed_storage);
+        src0 = &packed_src0;
+    }
+#endif
+
     // F32 chunks can have padding between rows to preserve the original destination stride.
     GGML_ASSERT(ggml_is_contiguous(dst) ||
         (compute_type == GGML_TYPE_F32 && ggml_is_contiguous_1(dst)));
@@ -2113,6 +2138,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+            // Keep every slot, including repeated expert IDs for the same token.
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
                 assert(expert_to_use >= 0 && expert_to_use < ne02);
@@ -2120,7 +2146,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
                 }
             }
         }
@@ -5555,7 +5580,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_UNARY_OP_ROUND:
                 case GGML_UNARY_OP_TRUNC:
                     if (op->src[0]->type == GGML_TYPE_BF16 && ggml_get_unary_op(op) == GGML_UNARY_OP_XIELU) {
+#if defined(GGML_USE_MACA)
+                        return op->type == GGML_TYPE_BF16 && ggml_maca_copy_layout(op->src[0]) && ggml_maca_copy_layout(op) &&
+                               ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                               ggml_nelements(op) <= INT_MAX - CUDA_XIELU_BLOCK_SIZE;
+#else
                         return false;
+#endif
                     }
                     return op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16;
                 default:
@@ -5642,9 +5673,28 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             }
         case GGML_OP_OUT_PROD:
+#if defined(GGML_USE_MACA)
+            if (op->src[0]->type != GGML_TYPE_F32) {
+                return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                       (op->src[0]->type == GGML_TYPE_F16 || ggml_is_quantized(op->src[0]->type)) &&
+                       ggml_maca_can_copy_f32(op->src[0]) && ggml_maca_copy_layout(op->src[1], false) &&
+                       (op->src[1]->nb[0] == sizeof(float) || op->src[1]->nb[1] == sizeof(float)) &&
+                       ggml_maca_copy_layout(op) && ggml_is_contiguous(op) && op->ne[0] <= INT_MAX && op->ne[1] <= INT_MAX &&
+                       op->src[0]->ne[1] <= INT_MAX && op->ne[3] <= 65535 && op->ne[3] > 0 &&
+                       op->ne[2] <= INT_MAX / op->ne[3] &&
+                       op->src[1]->nb[0] / sizeof(float) <= INT_MAX && op->src[1]->nb[1] / sizeof(float) <= INT_MAX;
+            }
+#endif
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:
             {
+#if defined(GGML_USE_MACA)
+                if (op->src[0]->type == GGML_TYPE_NVFP4) {
+                    return op->type == GGML_TYPE_F32 && ggml_maca_can_copy_f32(op->src[0]) &&
+                           op->src[1]->type == GGML_TYPE_I32 && ggml_maca_copy_layout(op->src[1]) &&
+                           ggml_maca_copy_layout(op) && ggml_nelements(op) <= INT_MAX - CUDA_CPY_BLOCK_SIZE;
+                }
+#endif
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
@@ -5681,9 +5731,29 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             }
         case GGML_OP_GET_ROWS_BACK:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->ne[2] == 1 && op->ne[3] == 1;
+            {
+#if defined(GGML_USE_MACA)
+                if (op->src[0]->type == GGML_TYPE_F16) {
+                    return op->type == GGML_TYPE_F32 && ggml_maca_copy_layout(op) && ggml_is_contiguous(op) &&
+                           op->src[1]->type == GGML_TYPE_I32 && ggml_maca_copy_layout(op->src[1]) && ggml_is_contiguous(op->src[1]) &&
+                           op->ne[2] == 1 && op->ne[3] == 1 &&
+                           op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                           op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                           op->ne[0] <= INT_MAX && ggml_maca_can_copy_f32(op->src[0]);
+                }
+#endif
+                return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->ne[2] == 1 && op->ne[3] == 1;
+            }
         case GGML_OP_SET_ROWS:
             {
+#if defined(GGML_USE_MACA)
+                if (op->src[0]->type == GGML_TYPE_F16 &&
+                    (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16 || ggml_maca_can_quantize(op->type))) {
+                    return ggml_maca_can_copy_f32(op->src[0]) && ggml_maca_copy_layout(op) &&
+                           ggml_maca_copy_layout(op->src[1], false) &&
+                           (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
+                }
+#endif
                 return (
                            (
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
@@ -5707,6 +5777,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
+#if defined(GGML_USE_MACA)
+                if (ggml_is_quantized(src0_type) && src1_type == GGML_TYPE_F32 &&
+                    src0_type != GGML_TYPE_Q4_0 && src0_type != GGML_TYPE_Q4_1 &&
+                    src0_type != GGML_TYPE_Q5_0 && src0_type != GGML_TYPE_Q5_1 && src0_type != GGML_TYPE_Q8_0) {
+                    return ggml_maca_can_copy_f32(op->src[0]) && ggml_maca_copy_layout(op->src[1], false);
+                }
+                if (src0_type == src1_type && ggml_is_quantized(src0_type)) {
+                    return ggml_maca_copy_layout(op->src[0]) && ggml_maca_copy_layout(op->src[1]);
+                }
+                if ((src0_type == GGML_TYPE_F16 || src0_type == GGML_TYPE_BF16) && ggml_maca_can_quantize(src1_type) &&
+                    ggml_is_contiguous(op->src[1])) {
+                    return ggml_maca_copy_layout(op->src[0]) && ggml_maca_can_copy_f32(op->src[0]) &&
+                           ggml_maca_copy_layout(op->src[1]);
+                }
+#endif
                 if ((src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16 || src0_type == GGML_TYPE_F16) &&
                     (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_BF16 || src1_type == GGML_TYPE_F16)
                 ) {
@@ -5766,8 +5851,22 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_REPEAT:
             {
-                // the CUDA REPEAT path only implements F32/F16; other types assert at runtime
                 ggml_type src0_type = op->src[0]->type;
+#if defined(GGML_USE_MACA)
+                if (src0_type == GGML_TYPE_I16 || src0_type == GGML_TYPE_I32 || src0_type == GGML_TYPE_BF16) {
+                    if (op->type != src0_type || !ggml_maca_copy_layout(op) || !ggml_is_contiguous(op) ||
+                        !ggml_maca_copy_layout(op->src[0], false) ||
+                        ggml_nelements(op) > UINT32_MAX - 128) {
+                        return false;
+                    }
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                        if (op->src[0]->nb[d] / ggml_type_size(src0_type) > UINT32_MAX) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+#endif
                 return src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16;
             }
         case GGML_OP_REPEAT_BACK:
@@ -5777,6 +5876,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
                 const int32_t dim = op->op_params[0];
+#if defined(GGML_USE_MACA)
+                if (ggml_is_quantized(src0_type) && dim == 3 &&
+                    (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op->src[1]))) {
+                    return src0_type == src1_type && op->type == src0_type &&
+                           ggml_maca_copy_layout(op->src[0]) && ggml_maca_copy_layout(op->src[1]) &&
+                           ggml_maca_copy_layout(op) && ggml_is_contiguous(op) &&
+                           op->ne[1] <= INT_MAX && op->ne[2] <= 65535 && op->ne[3] <= 65535;
+                }
+#endif
                 return src0_type == src1_type &&
                        src0_type == op->type &&
                        (
@@ -5827,8 +5935,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SILU_BACK:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_NORM:
-        case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
+#if defined(GGML_USE_MACA)
+            if (!ggml_is_contiguous_rows(op->src[0])) {
+                return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                       ggml_maca_can_copy_f32(op->src[0]) && ggml_maca_copy_layout(op) && ggml_is_contiguous(op) &&
+                       op->ne[0] <= INT_MAX - 1024 && op->ne[1] <= INT_MAX && op->ne[2] <= 65535 && op->ne[3] <= 65535;
+            }
+#endif
+            return ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_RMS_NORM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
@@ -5900,12 +6016,65 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return false;
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK: {
+#if defined(GGML_USE_MACA)
+            const ggml_tensor * src = op->src[0];
+            if (!ggml_is_contiguous_2(src)) {
+                if ((src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) || op->type != src->type ||
+                    !ggml_maca_copy_layout(src) || !ggml_maca_copy_layout(op) ||
+                    src->ne[0] % 2 != 0 || src->ne[0] > INT_MAX - 2 * CUDA_ROPE_BLOCK_SIZE ||
+                    ggml_nrows(src) > INT_MAX) {
+                    return false;
+                }
+                // The existing kernels accept row/batch strides, but use int offsets.
+                for (const ggml_tensor * t : {src, op}) {
+                    const size_t ts = ggml_type_size(t->type);
+                    if (ggml_nbytes(t) / ts > INT_MAX) {
+                        return false;
+                    }
+                    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                        if (t->nb[d] / ts > INT_MAX || t->nb[d] % (2 * ts) != 0) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+#endif
             return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
         }
-        case GGML_OP_IM2COL:
-        case GGML_OP_IM2COL_3D:
         case GGML_OP_CONV_2D:
+#if defined(GGML_USE_MACA)
+            if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op->src[1])) {
+                return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
+                       op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                       ggml_maca_copy_layout(op->src[0], false) && ggml_maca_copy_layout(op->src[1], false) &&
+                       ggml_maca_copy_layout(op) && ggml_is_contiguous(op) &&
+                       ggml_nelements(op->src[0]) <= INT_MAX - 256 && ggml_nelements(op->src[1]) <= INT_MAX - 256 &&
+                       ggml_nelements(op) <= INT_MAX - 256 && op->op_params[6] == 0;
+            }
+#endif
             return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
+        case GGML_OP_IM2COL:
+            return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
+        case GGML_OP_IM2COL_3D:
+#if defined(GGML_USE_MACA)
+            {
+                const int32_t channels = op->op_params[9];
+                if (op->src[1]->type != GGML_TYPE_F32 || (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) ||
+                    channels <= 0 || op->src[1]->ne[3] < channels || op->src[1]->ne[3] % channels != 0 ||
+                    !ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    if (op->src[1]->nb[d] % sizeof(float) != 0) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+#else
+            return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
+#endif
         case GGML_OP_CONV_3D:
             return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
                    op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
@@ -5918,11 +6087,26 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_POOL_2D:
             return true;
         case GGML_OP_ACC:
+#if defined(GGML_USE_MACA)
+            if (!ggml_is_contiguous(op->src[1])) {
+                return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                       op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                       ggml_maca_copy_layout(op->src[0]) && ggml_maca_copy_layout(op) && ggml_is_contiguous(op) &&
+                       ggml_maca_can_copy_f32(op->src[1]) &&
+                       ggml_nelements(op) <= INT_MAX - CUDA_ACC_BLOCK_SIZE;
+            }
+#endif
             // TODO: extend support like so:
             //return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);
             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
         case GGML_OP_SUM:
+#if defined(GGML_USE_MACA)
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   ggml_maca_copy_layout(op->src[0], false) && ggml_is_contiguously_allocated(op->src[0]) &&
+                   ggml_nelements(op->src[0]) <= INT_MAX - 8 * 512;
+#else
             return ggml_is_contiguously_allocated(op->src[0]);
+#endif
         case GGML_OP_TOP_K:
             return op->src[0]->ne[0] <= INT_MAX;
         case GGML_OP_ARGSORT:

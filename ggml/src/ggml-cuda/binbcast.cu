@@ -2,6 +2,7 @@
 #include "convert.cuh"
 #include <cstdint>
 #include <utility>
+#include <type_traits>
 
 template<typename T, size_t>
 using type_for_index = T;
@@ -83,6 +84,17 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
     for (uint32_t i0 = i0s; i0 < ne0; i0 += s0) {
         const uint32_t i10 = fastmodulo(i0, ne10);
 
+#if defined(GGML_USE_MACA)
+        // Integer instantiations are used only by REPEAT. Copy the value without
+        // converting through float (which loses I32 bits above 2^24).
+        if constexpr (std::is_integral<src1_t>::value) {
+            dst_row[i0] = src1[i_src1 + size_t(i10)*s10];
+            if (ne0 - i0 <= s0) {
+                break;
+            }
+            continue;
+        }
+#endif
         float result = src0_row ? ggml_cuda_cast<float>(src0_row[size_t(i0)*s00]) : 0.0f;
         if constexpr (sizeof...(src1_ptrs) > 0) {
             result = (..., (result = bin_op(result, ggml_cuda_cast<float>(src1s[i_src1 + size_t(i10)*s10]))));
@@ -155,6 +167,12 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
     const uint32_t i10 = fastmodulo(i0, ne10);
 
     ggml_cuda_pdl_sync();
+#if defined(GGML_USE_MACA)
+    if constexpr (std::is_integral<src1_t>::value) {
+        dst_row[i0] = src1[i_src1 + size_t(i10)*s10];
+        return;
+    }
+#endif
     float result = src0_row ? ggml_cuda_cast<float>(src0_row[size_t(i0)*s00]) : 0.0f;
     if constexpr (sizeof...(src1_ptrs) > 0) {
         result = (..., (result = bin_op(result, ggml_cuda_cast<float>(src1s[i_src1 + size_t(i10)*s10]))));
@@ -436,6 +454,19 @@ static void ggml_cuda_op_bin_bcast(
 }
 
 void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_USE_MACA)
+    GGML_ASSERT(dst->type == dst->src[0]->type);
+    if (dst->type == GGML_TYPE_I32) {
+        bin_bcast_cuda<op_repeat, 0>()(dst, dst->src[0], dst, (const int32_t *) nullptr,
+                (const int32_t *) dst->src[0]->data, (int32_t *) dst->data, ctx.stream());
+        return;
+    }
+    if (dst->type == GGML_TYPE_I16) {
+        bin_bcast_cuda<op_repeat, 0>()(dst, dst->src[0], dst, (const int16_t *) nullptr,
+                (const int16_t *) dst->src[0]->data, (int16_t *) dst->data, ctx.stream());
+        return;
+    }
+#endif
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_repeat, 0>>(dst, dst->src[0], dst, nullptr, dst->src[0]->data, dst->data, ctx.stream());
 }
 

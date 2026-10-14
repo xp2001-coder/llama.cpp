@@ -2,6 +2,9 @@
 #include "lightning-indexer.cuh"
 #include "fattn-common.cuh"
 #include "convert.cuh"
+#if defined(GGML_USE_MACA)
+#include "ggml-maca/copy.cuh"
+#endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #if defined(TURING_MMA_AVAILABLE)
@@ -569,6 +572,14 @@ static __global__ void lightning_indexer_kernel_tile(
 void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
+#if defined(GGML_USE_MACA)
+    ggml_cuda_pool_alloc<char> storage(ctx.pool());
+    ggml_tensor packed;
+    if (k->type == GGML_TYPE_IQ4_NL) {
+        packed = ggml_maca_copy_f32(ctx, k, storage);
+        k = &packed;
+    }
+#endif
     const ggml_tensor * w = dst->src[2]; // weights
     const ggml_tensor * m = dst->src[3]; // mask
 
@@ -780,6 +791,21 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) 
     }
 
     switch(k->type) {
+#if defined(GGML_USE_MACA)
+        case GGML_TYPE_IQ4_NL:
+            if (q->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+                m->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
+                !ggml_maca_can_copy_f32(k) || !ggml_is_contiguous(dst) ||
+                neq2 > 65535 || neq3 > 65535 || ggml_nelements(k) > (INT_MAX - 256) / sizeof(float)) {
+                return false;
+            }
+            for (const ggml_tensor * t : {q, k, w, m, dst}) {
+                if (!ggml_maca_copy_layout(t) || ggml_nbytes(t) > INT_MAX - 256) {
+                    return false;
+                }
+            }
+            return true;
+#endif
         case GGML_TYPE_F32:
         case GGML_TYPE_BF16:
         case GGML_TYPE_F16:

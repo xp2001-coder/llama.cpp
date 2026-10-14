@@ -1,4 +1,7 @@
 #include "getrows.cuh"
+#if defined(GGML_USE_MACA)
+#include "ggml-maca/copy.cuh"
+#endif
 #include "dequantize.cuh"
 #include "convert.cuh"
 
@@ -441,6 +444,15 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+#if defined(GGML_USE_MACA)
+    ggml_cuda_pool_alloc<char> storage(ctx.pool());
+    ggml_tensor packed;
+    if (src0->type == GGML_TYPE_NVFP4) {
+        packed = ggml_maca_copy_f32(ctx, src0, storage);
+        src0 = &packed;
+    }
+#endif
+
     cudaStream_t stream = ctx.stream();
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -459,6 +471,14 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0]; // gradients of forward pass output
     const ggml_tensor * src1 = dst->src[1]; // src1 in forward pass
+#if defined(GGML_USE_MACA)
+    ggml_cuda_pool_alloc<char> storage(ctx.pool());
+    ggml_tensor packed;
+    if (src0->type == GGML_TYPE_F16) {
+        packed = ggml_maca_copy_f32(ctx, src0, storage);
+        src0 = &packed;
+    }
+#endif
 
     GGML_TENSOR_BINARY_OP_LOCALS
 

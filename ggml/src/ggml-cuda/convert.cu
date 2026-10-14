@@ -5,6 +5,15 @@
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
+#if defined(GGML_USE_MACA)
+static __device__ __forceinline__ void dequantize_iq4_nl_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_iq4_nl * x = (const block_iq4_nl *) vx + ib;
+    const float d = __half2float(x->d);
+    v.x = d * kvalues_iq4nl[x->qs[iqs] & 0xf];
+    v.y = d * kvalues_iq4nl[x->qs[iqs] >> 4];
+}
+#endif
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y,
         const int64_t ne00, const int64_t ne01,
@@ -669,6 +678,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
 
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
     switch (type) {
+#if defined(GGML_USE_MACA)
+        case GGML_TYPE_IQ4_NL:
+            return dequantize_block_cuda<QK4_NL, 2, dequantize_iq4_nl_pair>;
+#endif
         case GGML_TYPE_F32:
             return convert_unary_cuda<float>;
         case GGML_TYPE_Q1_0:

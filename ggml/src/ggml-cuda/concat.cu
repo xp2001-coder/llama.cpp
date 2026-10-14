@@ -204,6 +204,21 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == src1->type);
     GGML_ASSERT(dst->type  == src0->type);
 
+#if defined(GGML_USE_MACA)
+    if (ggml_is_quantized(src0->type) && dim == 3 &&
+        (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1))) {
+        // Each quantized row is copied as bytes; outer strides still describe
+        // the original views. No dequantization or requantization is needed.
+        ggml_tensor a = *src0, b = *src1, out = *dst;
+        for (ggml_tensor * tensor : {&a, &b, &out}) {
+            tensor->ne[0] = ggml_row_size(tensor->type, tensor->ne[0]);
+            tensor->type = GGML_TYPE_I8;
+            tensor->nb[0] = 1;
+        }
+        concat_cuda<uint8_t>(&a, &b, &out, dim, stream);
+        return;
+    }
+#endif
     if (ggml_is_quantized(src0->type)) {
         if (dim == 3) {
             GGML_ASSERT(ggml_is_contiguous(src0));

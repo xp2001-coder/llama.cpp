@@ -1,6 +1,9 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+#if defined(GGML_USE_MACA)
+#include "ggml-maca/copy.cuh"
+#endif
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -427,6 +430,26 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
 }
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
+#if defined(GGML_USE_MACA)
+    // Keep the existing direct Q4/Q5/Q8 copy kernels on their fast path.
+    if (ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
+        src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q4_1 &&
+        src0->type != GGML_TYPE_Q5_0 && src0->type != GGML_TYPE_Q5_1 && src0->type != GGML_TYPE_Q8_0) {
+        GGML_ASSERT(ggml_maca_can_copy_f32(src0) && ggml_maca_copy_layout(src1, false));
+        ggml_cuda_pool_alloc<char> storage(ctx.pool());
+        const ggml_tensor packed = ggml_maca_copy_f32(ctx, src0, storage);
+        ggml_cuda_cpy(ctx, &packed, src1);
+        return;
+    }
+    if ((src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) && ggml_maca_can_quantize(src1->type)) {
+        GGML_ASSERT(ggml_is_contiguous(src1));
+        GGML_ASSERT(ggml_maca_copy_layout(src0) && ggml_maca_copy_layout(src1));
+        ggml_cuda_pool_alloc<char> storage(ctx.pool());
+        const ggml_tensor packed = ggml_maca_copy_f32(ctx, src0, storage);
+        ggml_cuda_cpy(ctx, &packed, src1);
+        return;
+    }
+#endif
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
 
@@ -477,6 +500,16 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+#if defined(GGML_USE_MACA)
+    } else if (src0->type == src1->type && ggml_is_quantized(src0->type)) {
+        GGML_ASSERT(ggml_maca_copy_layout(src0) && ggml_maca_copy_layout(src1));
+        const int64_t block_size = ggml_blck_size(src0->type);
+        const int64_t type_size = ggml_type_size(src0->type);
+        // Copy encoded bytes, including scales, without requantizing.
+        ggml_cpy_scalar_cuda<uint8_t, uint8_t>(src0_ddc, src1_ddc, (ne / block_size) * type_size,
+            (ne00 / block_size) * type_size, ne01, ne02, 1, nb01, nb02, nb03,
+            (ne10 / block_size) * type_size, ne11, ne12, 1, nb11, nb12, nb13, main_stream);
+#endif
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>

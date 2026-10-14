@@ -104,7 +104,9 @@ enum mmvq_parameter_table_id {
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
-#if defined(RDNA4)
+#if defined(GGML_USE_MACA)
+    return MMVQ_PARAMETERS_GENERIC;
+#elif defined(RDNA4)
     return MMVQ_PARAMETERS_RDNA4;
 #elif defined(RDNA3_0)
     return MMVQ_PARAMETERS_RDNA3_0;
@@ -430,7 +432,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
 template <ggml_type type>
 static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
-#if defined(RDNA4)
+#if defined(GGML_USE_MACA)
+    return MMVQ_MAX_BATCH_SIZE;
+#elif defined(RDNA4)
     return get_mmvq_mmid_max_batch_rdna4(type);
 #elif defined(RDNA3)
     return get_mmvq_mmid_max_batch_rdna3(type);
