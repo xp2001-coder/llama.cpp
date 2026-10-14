@@ -4,6 +4,9 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#if defined(GGML_USE_MACA)
+#include "ggml-maca/copy.cuh"
+#endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -521,9 +524,14 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
-// K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
+// K/V types with a direct instance or a supported conversion to the F16 kernels.
 static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     switch (type) {
+#if defined(GGML_USE_MACA)
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+#endif
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
@@ -617,6 +625,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (!gqa_opt_applies) {
                 return BEST_FATTN_KERNEL_NONE;
             }
+#if defined(GGML_USE_MACA)
+            // The generic tile launcher has only GQA-4 and GQA-16 variants
+            // for this head shape; MACA does not use NVIDIA's MMA launcher.
+            if (gqa_ratio % 4 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+#endif
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -626,9 +641,31 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+#if defined(GGML_USE_MACA)
+    for (const ggml_tensor * t : {K, V}) {
+        if (t->type == GGML_TYPE_IQ4_NL || t->type == GGML_TYPE_Q1_0 || t->type == GGML_TYPE_Q2_0) {
+            // The shared attention launchers narrow some byte strides to int.
+            // Bound both the encoded view and its packed F16 representation.
+            if (!ggml_maca_copy_layout(t) || ggml_nbytes(t) > INT_MAX - CUDA_CPY_BLOCK_SIZE ||
+                ggml_nelements(t) > (INT_MAX - CUDA_CPY_BLOCK_SIZE) / sizeof(half)) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+        }
+    }
+#endif
+
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
     }
+
+#if defined(GGML_USE_MACA)
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    // Match the generic tile/vec instances instead of selecting NO_DEVICE_CODE.
+    if (logit_softcap != 0.0f && V->ne[0] != 128 && V->ne[0] != 256 && V->ne[0] != 512) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+#endif
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.

@@ -1,6 +1,9 @@
 #include "out-prod.cuh"
 
 #include <cstdint>
+#if defined(GGML_USE_MACA)
+#include "ggml-maca/copy.cuh"
+#endif
 
 static __global__ void k_compute_out_prod_ptrs(
         const float * src0_d, const float * src1_d, float * dst_d,
@@ -27,6 +30,15 @@ static __global__ void k_compute_out_prod_ptrs(
 void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+#if defined(GGML_USE_MACA)
+    ggml_cuda_pool_alloc<char> storage(ctx.pool());
+    ggml_tensor packed;
+    if (src0->type != GGML_TYPE_F32) {
+        packed = ggml_maca_copy_f32(ctx, src0, storage);
+        src0 = &packed;
+    }
+#endif
 
     GGML_TENSOR_BINARY_OP_LOCALS
 

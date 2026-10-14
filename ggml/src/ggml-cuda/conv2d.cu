@@ -1,6 +1,9 @@
 #include "conv2d.cuh"
 #include "convert.cuh"
 #include "mma.cuh"
+#if defined(GGML_USE_MACA)
+#include "ggml-maca/copy.cuh"
+#endif
 
 struct conv_params {
     const int64_t IW, IH;
@@ -337,6 +340,18 @@ static void conv2d_cuda_f32(const float * X_D, const float * K_D, float * Y_D, c
 void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * kernel = dst->src[0];
     const ggml_tensor * input  = dst->src[1];
+#if defined(GGML_USE_MACA)
+    ggml_cuda_pool_alloc<char> kernel_storage(ctx.pool()), input_storage(ctx.pool());
+    ggml_tensor packed_kernel, packed_input;
+    if (!ggml_is_contiguous(kernel)) {
+        packed_kernel = ggml_maca_pack_scalar(ctx, kernel, kernel_storage);
+        kernel = &packed_kernel;
+    }
+    if (!ggml_is_contiguous(input)) {
+        packed_input = ggml_maca_pack_scalar(ctx, input, input_storage);
+        input = &packed_input;
+    }
+#endif
     float *             K_D    = (float *) kernel->data;
     const float *       X_D    = (const float *) input->data;
     float *             Y_D    = (float *) dst->data;

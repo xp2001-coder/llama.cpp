@@ -1,4 +1,7 @@
 #include "acc.cuh"
+#if defined(GGML_USE_MACA)
+#include "ggml-maca/copy.cuh"
+#endif
 
 static __global__ void acc_f32(const float * x, const float * y, float * dst, const int64_t ne,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
@@ -37,6 +40,14 @@ static void acc_f32_cuda(const float * x, const float * y, float * dst, const in
 void ggml_cuda_op_acc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+#if defined(GGML_USE_MACA)
+    ggml_cuda_pool_alloc<char> storage(ctx.pool());
+    ggml_tensor packed;
+    if (!ggml_is_contiguous(src1)) {
+        packed = ggml_maca_copy_f32(ctx, src1, storage);
+        src1 = &packed;
+    }
+#endif
 
     const float * src0_d = (const float *) src0->data;
     const float * src1_d = (const float *) src1->data;

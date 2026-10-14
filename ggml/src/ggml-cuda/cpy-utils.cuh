@@ -27,16 +27,28 @@ static __device__ void quantize_f32_q4_0_block(const float * __restrict__ x, blo
     }
 
     const float d  = vmax / -8;
+#if defined(GGML_USE_MACA)
+    const float id = d ? __fdiv_rn(1.0f, d) : 0.0f;
+#else
     const float id = d ? 1.0f/d : 0.0f;
+#endif
 
     y->d = d;
 
     for (int j = 0; j < QK4_0/2; ++j) {
+#if defined(GGML_USE_MACA)
+        // Keep the reference multiply and add rounding separate.
+        const float x0 = __fmul_rn(x[j], id);
+        const float x1 = __fmul_rn(x[QK4_0/2 + j], id);
+        const uint8_t xi0 = min(15, (int8_t) __fadd_rn(x0, 8.5f));
+        const uint8_t xi1 = min(15, (int8_t) __fadd_rn(x1, 8.5f));
+#else
         const float x0 = x[0       + j]*id;
         const float x1 = x[QK4_0/2 + j]*id;
 
         const uint8_t xi0 = min(15, (int8_t)(x0 + 8.5f));
         const uint8_t xi1 = min(15, (int8_t)(x1 + 8.5f));
+#endif
 
         y->qs[j]  = xi0;
         y->qs[j] |= xi1 << 4;
@@ -84,17 +96,29 @@ static __device__ void quantize_f32_q5_0_block(const float * __restrict__ x, blo
     }
 
     const float d  = vmax / -16;
+#if defined(GGML_USE_MACA)
+    const float id = d ? __fdiv_rn(1.0f, d) : 0.0f;
+#else
     const float id = d ? 1.0f/d : 0.0f;
+#endif
 
     y->d = d;
 
     uint32_t qh = 0;
     for (int j = 0; j < QK5_0/2; ++j) {
+#if defined(GGML_USE_MACA)
+        // Keep the reference multiply and add rounding separate.
+        const float x0 = __fmul_rn(x[j], id);
+        const float x1 = __fmul_rn(x[QK5_0/2 + j], id);
+        const uint8_t xi0 = min(31, (int8_t) __fadd_rn(x0, 16.5f));
+        const uint8_t xi1 = min(31, (int8_t) __fadd_rn(x1, 16.5f));
+#else
         const float x0 = x[0       + j]*id;
         const float x1 = x[QK5_0/2 + j]*id;
 
         const uint8_t xi0 = min(31, (int8_t)(x0 + 16.5f));
         const uint8_t xi1 = min(31, (int8_t)(x1 + 16.5f));
+#endif
 
         y->qs[j]  = (xi0 & 0xf) | ((xi1 & 0xf) << 4);
         qh |= ((xi0 & 0x10u) >> 4) << (j + 0);
@@ -142,14 +166,24 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
         amax = fmaxf(amax, fabsf(v));
     }
 
+#if defined(GGML_USE_MACA)
+    const float d = __fdiv_rn(amax, 127.0f);
+    const float id = amax ? __fdiv_rn(127.0f, amax) : 0.0f;
+#else
     const float d = amax / ((1 << 7) - 1);
     const float id = d ? 1.0f/d : 0.0f;
+#endif
 
     y->d = d;
 
     for (int j = 0; j < QK8_0; ++j) {
+#if defined(GGML_USE_MACA)
+        // Match the nearest-even rule used by the CPU SIMD quantizer.
+        y->qs[j] = __float2int_rn(__fmul_rn(x[j], id));
+#else
         const float x0 = x[j]*id;
         y->qs[j] = roundf(x0);
+#endif
     }
 }
 

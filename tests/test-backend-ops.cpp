@@ -1495,15 +1495,17 @@ struct test_case {
             const char * bn1 = ggml_backend_name(ud->backend1);
             const char * bn2 = ggml_backend_name(ud->backend2);
 
-            if (t1->op == GGML_OP_NONE) {
-                // sentinels must be unchanged
+            if (t1->op == GGML_OP_NONE ||
+                (t1->op == GGML_OP_REPEAT && (t1->type == GGML_TYPE_I16 || t1->type == GGML_TYPE_I32))) {
+                // Sentinels must be unchanged. Integer REPEAT must also preserve
+                // every bit; conversion to float below cannot detect lost I32 LSBs.
                 std::vector<uint8_t> t1_data(ggml_nbytes(t1));
                 std::vector<uint8_t> t2_data(ggml_nbytes(t2));
                 ggml_backend_tensor_get(t1, t1_data.data(), 0, ggml_nbytes(t1));
                 ggml_backend_tensor_get(t2, t2_data.data(), 0, ggml_nbytes(t2));
 
                 if (memcmp(t1_data.data(), t2_data.data(), ggml_nbytes(t1)) != 0) {
-                    printf("sentinel mismatch: %s ", t1->name);
+                    printf("exact byte mismatch: %s ", t1->name);
                     ud->ok = false;
                     return true;
                 }
@@ -2976,6 +2978,35 @@ struct test_repeat : public test_case {
     }
 };
 
+// Exact integer REPEAT boundary regression.
+struct test_repeat_integer : public test_repeat {
+    using test_repeat::test_repeat;
+
+    std::string vars() override {
+        return test_repeat::vars() + ",integer_boundary=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_repeat::initialize_tensors(ctx);
+        ggml_tensor * src = ggml_get_tensor(ctx, "src");
+        if (type == GGML_TYPE_I32) {
+            const int32_t values[] = {0, 1, -1, 16777217, -16777217, 33554431, INT32_MAX, INT32_MIN};
+            std::vector<int32_t> data(ggml_nelements(src));
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i] = values[i % 8];
+            }
+            ggml_backend_tensor_set(src, data.data(), 0, data.size() * sizeof(int32_t));
+        } else {
+            const int16_t values[] = {0, 1, -1, 257, -257, 16385, INT16_MAX, INT16_MIN};
+            std::vector<int16_t> data(ggml_nelements(src));
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i] = values[i % 8];
+            }
+            ggml_backend_tensor_set(src, data.data(), 0, data.size() * sizeof(int16_t));
+        }
+    }
+};
+
 // GGML_OP_REPEAT_BACK
 struct test_repeat_back : public test_case {
     const ggml_type type;
@@ -3239,6 +3270,46 @@ struct test_cpy : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             // test extended range of values to check if casting between f32 and i32 is consistent
             init_tensor_uniform(t, -150.f, 150.f);
+        }
+    }
+};
+
+struct test_cpy_rounding : public test_cpy {
+    test_cpy_rounding(ggml_type src_type, ggml_type dst_type, bool permuted)
+        : test_cpy(src_type, dst_type, {256, 2, 3, 2}, {-1, -1, -1, -1},
+                   permuted ? std::array<int64_t, 4>{0, 3, 1, 2} : std::array<int64_t, 4>{0, 0, 0, 0}) {}
+
+    std::string vars() override {
+        return test_cpy::vars() + ",rounding=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_cpy::initialize_tensors(ctx);
+        ggml_tensor * src = ggml_get_tensor(ctx, "src");
+        GGML_ASSERT(src != nullptr && ggml_is_contiguous(src));
+        const size_t n = ggml_nelements(src);
+        std::vector<float> data(n);
+        const float values_q4[] = {24.0f, 13.5f, -13.5f, 0.0f};
+        const float values_q5[] = {48.0f, 25.5f, -25.5f, 0.0f};
+        const float values_q8[] = {127.0f, 0.5f, -0.5f, 1.5f, -1.5f, 2.5f, -2.5f, 0.0f};
+        for (size_t i = 0; i < n; ++i) {
+            const int block = (i/32) % 4;
+            const float scale = block == 0 ? 0.0f : block == 1 ? 1.0f : block == 2 ? -1.0f : 0.5f;
+            const float value = type_dst == GGML_TYPE_Q4_0 ? values_q4[i % 4] :
+                                type_dst == GGML_TYPE_Q5_0 ? values_q5[i % 4] : values_q8[i % 8];
+            data[i] = scale * value;
+        }
+        if (src->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(src, data.data(), 0, n*sizeof(float));
+        } else if (src->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> converted(n);
+            ggml_fp32_to_fp16_row(data.data(), converted.data(), n);
+            ggml_backend_tensor_set(src, converted.data(), 0, n*sizeof(ggml_fp16_t));
+        } else {
+            GGML_ASSERT(src->type == GGML_TYPE_BF16);
+            std::vector<ggml_bf16_t> converted(n);
+            ggml_fp32_to_bf16_row(data.data(), converted.data(), n);
+            ggml_backend_tensor_set(src, converted.data(), 0, n*sizeof(ggml_bf16_t));
         }
     }
 };
@@ -6644,14 +6715,16 @@ struct test_im2col_3d : public test_case {
         ggml_set_name(input, "input");
 
         if (v) {
-            input = ggml_view_4d(ctx, input, ne_input[0] - 2, ne_input[1] - 2, ne_input[2] - 2, ne_input[3] - 2, input->nb[1], input->nb[2], input->nb[3], 0);
+            input = ggml_view_4d(ctx, input, ne_input[0] - 2, ne_input[1] - 2, ne_input[2] - 2, ne_input[3], input->nb[1], input->nb[2], input->nb[3], 0);
             ggml_set_name(input, "view_of_input");
         }
 
         ggml_tensor * kernel = ggml_new_tensor(ctx, type_kernel, 4, ne_kernel.data());
         ggml_set_name(kernel, "kernel");
 
+        GGML_ASSERT(IC > 0 && input->ne[3] >= IC && input->ne[3] % IC == 0);
         ggml_tensor * out = ggml_im2col_3d(ctx, kernel, input, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2, dst_type);
+        GGML_ASSERT(!ggml_is_empty(out));
         ggml_set_name(out, "out");
 
         return out;
@@ -7791,6 +7864,37 @@ struct test_sum : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             init_tensor_uniform(t, -0.9f, 1.1f);
         }
+    }
+};
+
+struct test_sum_integer_oracle : public test_sum {
+    test_sum_integer_oracle(std::array<int64_t, 4> shape, std::array<int64_t, 4> permutation)
+        : test_sum(GGML_TYPE_F32, shape, permutation) {}
+
+    std::string vars() override {
+        return test_sum::vars() + ",oracle=integer_sum";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_sum::initialize_tensors(ctx);
+        ggml_tensor * a = ggml_get_tensor(ctx, "a");
+        GGML_ASSERT(a && a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+        std::vector<float> values(ggml_nelements(a));
+        for (size_t i = 0; i < values.size(); ++i) {
+            values[i] = float(i + 1);
+        }
+        ggml_backend_tensor_set(a, values.data(), 0, values.size() * sizeof(float));
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (n == 1) {
+            const int64_t count = ne[0] * ne[1] * ne[2] * ne[3];
+            const float expected = float(count * (count + 1) / 2);
+            if (a[0] != expected || b[0] != expected) {
+                return INFINITY;
+            }
+        }
+        return test_case::err(a, b, n);
     }
 };
 
@@ -9809,6 +9913,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, type, GGML_TYPE_I32, { 256, 9, 2, 2 }, { 2, 3 }, 6, true));
+    }
 
     for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_VISION, GGML_ROPE_TYPE_IMROPE }) {
         for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -9927,6 +10034,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32));
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    for (int IC : {1, 3}) {
+        test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16,
+            {10, 10, 10, 6}, {3, 3, 3, 3}, IC, 1, 1, 1, 1, 1, 1, 1, 1, 1, true));
+    }
     for (int s0 : {1, 3}) {
         for (int s1 : {1, 3}) {
             for (int s2 : {1, 3}) {
@@ -10198,6 +10309,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_repeat(GGML_TYPE_I16, {10, 5, 4, ne3}, {1, 1, 1, 2}));
         test_cases.emplace_back(new test_repeat(GGML_TYPE_BF16, {10, 5, 4, ne3}, {2, 1, 1, 1}));
     }
+    for (ggml_type type : {GGML_TYPE_I16, GGML_TYPE_I32}) {
+        test_cases.emplace_back(new test_repeat_integer(type, {8, 3, 2, 2}, {2, 1, 1, 1}));
+        test_cases.emplace_back(new test_repeat_integer(type, {8, 3, 2, 2}, {1, 2, 2, 2}));
+    }
 
     for (bool view : {false, true}) {
         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {1, 1, 1, 1}, view));
@@ -10279,6 +10394,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
+
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL, GGML_TYPE_NVFP4}) {
+        test_cases.emplace_back(new test_cpy(type, type, {512, 2, 3, 2}, {256, 4, 3, 2}, {0, 2, 1, 3}, {0, 0, 0, 0}, false, {512, 5, 4, 3}));
+    }
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        test_cases.emplace_back(new test_cpy(type, GGML_TYPE_Q8_0, {256, 2, 3, 2}, {-1, -1, -1, -1}, {0, 3, 1, 2}));
+    }
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (ggml_type dst : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0}) {
+            for (bool permuted : {false, true}) {
+                test_cases.emplace_back(new test_cpy_rounding(type, dst, permuted));
+            }
+        }
+    }
 
     // CPY - different src/dst shapes (reshaping via CPY)
     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
@@ -10812,6 +10941,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // test cases with large batch size
             test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 8, 256, {1536, 1}, {1, 1}));
         }
+    }
+
+    // Quantized BLAS fallback with row gaps, batch gaps and broadcast batches.
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                             GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                             GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 7, 9, 512, {2, 3}, {2, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 7, 9, 512, {2, 3}, {2, 1}, {0, 1, 2, 3}, 768));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 7, 9, 512, {2, 3}, {2, 1}, {0, 1, 2, 3}, 0, 1, false, 9));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 7, 9, 512, {2, 3}, {2, 1}, {0, 1, 2, 3}, 768, 1, false, 9, ggml_type_size(type_a)));
     }
 
     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
@@ -11466,6 +11605,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 1024, 1, 1 }));
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 256, 1, 1 }));
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 256, 1, 1 }, { 1, 0, 2, 3 })); // sum dst not-contiguous
+    test_cases.emplace_back(new test_sum_integer_oracle({33, 256, 1, 1}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_sum_integer_oracle({3, 5, 2, 2}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_sum_rows());
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 11, 5, 6, 3 }, true, false));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 11, 5, 6, 3 }, false, true));
