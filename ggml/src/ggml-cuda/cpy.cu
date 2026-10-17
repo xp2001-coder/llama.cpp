@@ -429,8 +429,46 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     return spitch >= width && dpitch >= width;
 }
 
+#if defined(GGML_USE_MACA)
+template<typename block_t, int qk, void (*quantize)(const float *, block_t *)>
+static __global__ void maca_quantize_contiguous(const float * src, block_t * dst, int64_t blocks) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < blocks) {
+        quantize(src + i * qk, dst + i);
+    }
+}
+#endif
+
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
 #if defined(GGML_USE_MACA)
+    if (ggml_maca_can_quantize_extended(src1->type) &&
+        (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)) {
+        ggml_maca_quantize(ctx, src0, src1, nullptr);
+        return;
+    }
+    if (ggml_maca_can_quantize_lowbit(src1->type) &&
+        (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)) {
+        GGML_ASSERT(ggml_maca_can_copy_f32(src0) && ggml_is_contiguous(src1));
+        GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(src1));
+        ggml_cuda_pool_alloc<char> storage(ctx.pool());
+        const ggml_tensor packed = ggml_maca_copy_f32(ctx, src0, storage);
+        const int64_t count = ggml_nelements(src0);
+#define MACA_QUANT_COPY(TYPE, BLOCK, QK, FN) \
+        case TYPE: \
+            maca_quantize_contiguous<BLOCK, QK, FN><<<(count / QK + 127) / 128, 128, 0, ctx.stream()>>> \
+                ((const float *) packed.data, (BLOCK *) src1->data, count / QK); \
+            break
+        switch (src1->type) {
+            MACA_QUANT_COPY(GGML_TYPE_Q1_0, block_q1_0, QK1_0, quantize_f32_q1_0_block);
+            MACA_QUANT_COPY(GGML_TYPE_Q2_0, block_q2_0, QK2_0, quantize_f32_q2_0_block);
+            MACA_QUANT_COPY(GGML_TYPE_TQ1_0, block_tq1_0, QK_K, quantize_f32_tq1_0_block);
+            MACA_QUANT_COPY(GGML_TYPE_TQ2_0, block_tq2_0, QK_K, quantize_f32_tq2_0_block);
+            default: GGML_ABORT("unsupported low-bit copy");
+        }
+#undef MACA_QUANT_COPY
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     // Keep the existing direct Q4/Q5/Q8 copy kernels on their fast path.
     if (ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
         src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q4_1 &&

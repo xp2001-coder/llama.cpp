@@ -6,6 +6,48 @@
 #define CUDA_Q8_0_NE_ALIGN 2048
 
 #if defined(GGML_USE_MACA)
+template <typename dst_t, bool tq1>
+static __global__ void dequantize_maca_ternary(const void * vx, dst_t * y, int64_t count) {
+    static_assert(QK_K == 256, "ternary block layout");
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+    const int column = i % QK_K;
+    int value;
+    float scale;
+    if constexpr (tq1) {
+        const block_tq1_0 & block = ((const block_tq1_0 *) vx)[i / QK_K];
+        const int powers[] = {1, 3, 9, 27, 81};
+        uint8_t encoded;
+        int digit;
+        if (column < 160) {
+            encoded = block.qs[column % 32];
+            digit = column / 32;
+        } else if (column < 240) {
+            encoded = block.qs[32 + (column - 160) % 16];
+            digit = (column - 160) / 16;
+        } else {
+            encoded = block.qh[(column - 240) % 4];
+            digit = (column - 240) / 4;
+        }
+        const uint8_t shifted = encoded * powers[digit];
+        value = ((uint16_t(shifted) * 3) >> 8) - 1;
+        scale = __half2float(block.d);
+    } else {
+        const block_tq2_0 & block = ((const block_tq2_0 *) vx)[i / QK_K];
+        value = ((block.qs[(column / 128) * 32 + column % 32] >> (2 * ((column % 128) / 32))) & 3) - 1;
+        scale = __half2float(block.d);
+    }
+    y[i] = ggml_cuda_cast<dst_t>(scale * value);
+}
+
+template <typename dst_t, bool tq1>
+static void dequantize_maca_ternary_cuda(const void * vx, dst_t * y, int64_t count, cudaStream_t stream) {
+    GGML_ASSERT(count > 0 && count % QK_K == 0 && count <= INT_MAX - CUDA_DEQUANTIZE_BLOCK_SIZE);
+    dequantize_maca_ternary<dst_t, tq1><<<(count + 255) / 256, 256, 0, stream>>>(vx, y, count);
+}
+
 static __device__ __forceinline__ void dequantize_iq4_nl_pair(const void * vx, const int64_t ib, const int iqs, float2 & v) {
     const block_iq4_nl * x = (const block_iq4_nl *) vx + ib;
     const float d = __half2float(x->d);
@@ -504,6 +546,10 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
 
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
+#if defined(GGML_USE_MACA)
+        case GGML_TYPE_TQ1_0: return dequantize_maca_ternary_cuda<nv_bfloat16, true>;
+        case GGML_TYPE_TQ2_0: return dequantize_maca_ternary_cuda<nv_bfloat16, false>;
+#endif
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
@@ -561,6 +607,10 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
+#if defined(GGML_USE_MACA)
+        case GGML_TYPE_TQ1_0: return dequantize_maca_ternary_cuda<half, true>;
+        case GGML_TYPE_TQ2_0: return dequantize_maca_ternary_cuda<half, false>;
+#endif
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:
@@ -621,6 +671,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
+#if defined(GGML_USE_MACA)
+        case GGML_TYPE_TQ1_0: return dequantize_maca_ternary_cuda<float, true>;
+        case GGML_TYPE_TQ2_0: return dequantize_maca_ternary_cuda<float, false>;
+#endif
         case GGML_TYPE_Q1_0:
             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
         case GGML_TYPE_Q2_0:

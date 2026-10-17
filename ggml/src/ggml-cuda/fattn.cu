@@ -6,6 +6,7 @@
 #include "fattn.cuh"
 #if defined(GGML_USE_MACA)
 #include "ggml-maca/copy.cuh"
+#include "ggml-maca/fattn.cuh"
 #endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -522,6 +523,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_MACA_F32 = 500,
 };
 
 // K/V types with a direct instance or a supported conversion to the F16 kernels.
@@ -546,7 +548,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static best_fattn_kernel ggml_cuda_get_shared_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -756,6 +758,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    const best_fattn_kernel kernel = ggml_cuda_get_shared_fattn_kernel(device, dst);
+#if defined(GGML_USE_MACA) && defined(FLASH_ATTN_AVAILABLE)
+    // Explicit diagnostic A/B path. Default dispatch and precision are unchanged.
+    const char * force_f32 = getenv("GGML_MACA_FA_FORCE_F32");
+    if (force_f32 && strcmp(force_f32, "1") == 0 && ggml_maca_fattn_supported(dst)) {
+        return BEST_FATTN_KERNEL_MACA_F32;
+    }
+    if (kernel == BEST_FATTN_KERNEL_NONE && ggml_maca_fattn_supported(dst)) {
+        return BEST_FATTN_KERNEL_MACA_F32;
+    }
+#endif
+    return kernel;
+}
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -783,6 +800,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
         case BEST_FATTN_KERNEL_NONE:
+        case BEST_FATTN_KERNEL_MACA_F32:
             break;
     }
 
@@ -794,7 +812,24 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+#if defined(GGML_USE_MACA)
+    if (getenv("GGML_MACA_FA_DIAG")) {
+        const char * name = kernel == BEST_FATTN_KERNEL_MACA_F32 ? "maca_f32" :
+                           kernel == BEST_FATTN_KERNEL_TILE ? "tile" :
+                           kernel == BEST_FATTN_KERNEL_VEC ? "vec" :
+                           kernel == BEST_FATTN_KERNEL_MMA_F16 ? "mma_f16" : "none";
+        GGML_LOG_INFO("MACA_FA_PATH kernel=%s k=%s v=%s nb=%lld kv=%lld\n", name,
+                      ggml_type_name(dst->src[1]->type), ggml_type_name(dst->src[2]->type),
+                      (long long) dst->src[0]->ne[1], (long long) dst->src[1]->ne[1]);
+    }
+#endif
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_MACA_F32:
+#if defined(GGML_USE_MACA)
+            ggml_maca_fattn(ctx, dst);
+            break;
+#endif
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

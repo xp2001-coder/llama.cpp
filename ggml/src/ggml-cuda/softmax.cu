@@ -474,7 +474,14 @@ void ggml_cuda_op_soft_max_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
+#if defined(GGML_USE_MACA)
+    // ALiBi adds a constant to the forward logits. Given the forward output,
+    // dL/dx = scale * y * (dL/dy - dot(y, dL/dy)) also holds with that bias.
+    // This op does not compute a gradient for the mask or the ALiBi slope.
+    GGML_UNUSED(max_bias);
+#else
     GGML_ASSERT(max_bias == 0.0f);
+#endif
 
     soft_max_back_f32_cuda(src0_d, src1_d, dst_d, ncols, nrows, scale, stream);
 }

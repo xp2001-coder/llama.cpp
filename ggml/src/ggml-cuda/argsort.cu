@@ -235,6 +235,43 @@ static int next_power_of_2(int x) {
     return n;
 }
 
+#if defined(GGML_USE_MACA)
+template<ggml_sort_order order>
+static __global__ void k_argsort_global_step(const float * x, int * indices, int ncols, int padded, int k, int j) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < padded) {
+        bitonic_step<order>(x + int64_t(blockIdx.y) * ncols, indices + int64_t(blockIdx.y) * padded, ncols, col, k, j);
+    }
+}
+
+static void argsort_maca_global(ggml_backend_cuda_context & ctx, const float * x, int * dst,
+        int ncols, int nrows, ggml_sort_order order) {
+    const int padded = next_power_of_2(ncols);
+    const int chunk = std::min(65535, ggml_cuda_chunk_nrows(size_t(padded) * sizeof(int), nrows));
+    ggml_cuda_pool_alloc<int> indices(ctx.pool(), size_t(chunk) * padded);
+    for (int row = 0; row < nrows; row += chunk) {
+        const int rows = std::min(chunk, nrows - row);
+        const dim3 grid((padded + 255) / 256, rows);
+        init_indices<<<grid, 256, 0, ctx.stream()>>>(indices.get(), padded, rows);
+        for (int k = 2; k <= padded; k *= 2) {
+            for (int j = k / 2; j; j /= 2) {
+                if (order == GGML_SORT_ORDER_ASC) {
+                    k_argsort_global_step<GGML_SORT_ORDER_ASC><<<grid, 256, 0, ctx.stream()>>>
+                        (x + int64_t(row) * ncols, indices.get(), ncols, padded, k, j);
+                } else {
+                    k_argsort_global_step<GGML_SORT_ORDER_DESC><<<grid, 256, 0, ctx.stream()>>>
+                        (x + int64_t(row) * ncols, indices.get(), ncols, padded, k, j);
+                }
+            }
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy2DAsync(dst + int64_t(row) * ncols, size_t(ncols) * sizeof(int),
+            indices.get(), size_t(padded) * sizeof(int), size_t(ncols) * sizeof(int), rows,
+            cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+}
+#endif
+
 void argsort_f32_i32_cuda_bitonic(const float *   x,
                                   int *           dst,
                                   const int       ncols,
@@ -278,6 +315,13 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t nrows = ggml_nrows(src0);
 
     enum ggml_sort_order order = (enum ggml_sort_order) dst->op_params[0];
+
+#if defined(GGML_USE_MACA)
+    if (size_t(next_power_of_2(ncols)) * sizeof(int) > ggml_cuda_info().devices[ctx.device].smpb) {
+        argsort_maca_global(ctx, src0_d, (int *) dst_d, ncols, nrows, order);
+        return;
+    }
+#endif
 
 #ifdef GGML_CUDA_USE_CUB
     const int    ncols_pad      = next_power_of_2(ncols);

@@ -449,7 +449,7 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #if defined(GGML_USE_MACA)
     ggml_cuda_pool_alloc<char> storage(ctx.pool());
     ggml_tensor packed;
-    if (src0->type == GGML_TYPE_NVFP4) {
+    if (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_TQ1_0 || src0->type == GGML_TYPE_TQ2_0) {
         packed = ggml_maca_copy_f32(ctx, src0, storage);
         src0 = &packed;
     }
@@ -476,7 +476,7 @@ void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 #if defined(GGML_USE_MACA)
     ggml_cuda_pool_alloc<char> storage(ctx.pool());
     ggml_tensor packed;
-    if (src0->type == GGML_TYPE_F16) {
+    if (src0->type != GGML_TYPE_F32) {
         packed = ggml_maca_copy_f32(ctx, src0, storage);
         src0 = &packed;
     }
