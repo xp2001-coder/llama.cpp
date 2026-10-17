@@ -34,8 +34,31 @@ endforeach()
 ggml_cuda_fattn_vec_instances("${MACA_CUDA_SOURCE_DIR}" MACA_INSTANCES)
 list(APPEND MACA_SOURCES ${MACA_INSTANCES})
 
+list(APPEND MACA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/quantize.cu")
+
+# Quantizer code selection depends on the scalar reference rounding order.
+set(GGML_MACA_QUANTIZE_FP_MODE "bridge" CACHE STRING "Quantizer-only floating point mode")
+set_property(CACHE GGML_MACA_QUANTIZE_FP_MODE PROPERTY STRINGS bridge clang clang-strict)
+if (GGML_MACA_QUANTIZE_FP_MODE STREQUAL "bridge")
+    set(MACA_QUANTIZE_FP_OPTIONS --fmad=false)
+elseif (GGML_MACA_QUANTIZE_FP_MODE STREQUAL "clang")
+    set(MACA_QUANTIZE_FP_OPTIONS -ffp-contract=off)
+elseif (GGML_MACA_QUANTIZE_FP_MODE STREQUAL "clang-strict")
+    set(MACA_QUANTIZE_FP_OPTIONS -fno-fast-math -ffp-contract=off)
+else()
+    message(FATAL_ERROR "Unknown GGML_MACA_QUANTIZE_FP_MODE")
+endif()
+set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/quantize.cu" APPEND PROPERTY
+    COMPILE_OPTIONS ${MACA_QUANTIZE_FP_OPTIONS})
+message(STATUS "MACA quantizer-only FP options: ${MACA_QUANTIZE_FP_OPTIONS}")
+
 if (LLAMA_BUILD_TESTS)
     list(PREPEND MACA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/maca/backend-warp-constexpr.cu")
+    add_executable(test-maca-quantize-reference "${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/maca/quantize-reference.cpp")
+    target_include_directories(test-maca-quantize-reference PRIVATE ".." "../../include")
+    target_link_libraries(test-maca-quantize-reference PRIVATE ggml-base)
+    target_compile_features(test-maca-quantize-reference PRIVATE cxx_std_17)
+    target_compile_options(test-maca-quantize-reference PRIVATE -ffp-contract=off)
 endif()
 
 ggml_add_backend_library(ggml-maca ${MACA_SOURCES} ${MACA_HEADERS}

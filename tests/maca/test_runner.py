@@ -126,7 +126,7 @@ class RunnerTests(unittest.TestCase):
 
     def simulate_run(self, mode="all", bad_step=None, false_success=False, full_ops=False, inventory=False, changed_case=None,
                      flash_attn=False, manifest_flash=None, bad_steps=None, step_outputs=None, interrupt_step=None,
-                     manifest_op=None):
+                     manifest_op=None, host_reference=False, manifest_host=None, fa_seed=None, fa_replay=False):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary)
             source = path / "source"
@@ -142,7 +142,7 @@ class RunnerTests(unittest.TestCase):
                 tool.write_text("mock\n")
             build = path / "build"
             environments = []
-            mock_ops = ("ADD", "MUL_MAT", *run.DATA_OPS) + (("FLASH_ATTN_EXT",) if flash_attn else ())
+            mock_ops = tuple(dict.fromkeys(("ADD", "MUL_MAT", *run.DATA_OPS))) + (("FLASH_ATTN_EXT",) if flash_attn else ())
 
             def fake_execute(command, log, env, timeout):
                 environments.append(dict(env))
@@ -160,6 +160,21 @@ class RunnerTests(unittest.TestCase):
                     text = "MACA_PROBE_PASS " + log.stem[len("run-"):] + "\n"
                 elif log.stem == "backend-devices":
                     text = "Available devices:\n  MACA0: MetaX C500\n"
+                elif log.stem == "quantize-host-reference":
+                    text = "PASS quantizer host reference: 540/540; NOT a GPU test\n"
+                elif log.stem.startswith("fa-replay-"):
+                    inputs = "".join("%d:0123456789abcdef:100;" % i for i in range(4))
+                    path_name = "maca_f32" if env["GGML_MACA_FA_FORCE_F32"] == "1" else "tile"
+                    text = "FA_REPRO seed=%s case=mock=1 inputs=%s\n" % (env["LLAMA_TEST_FA_SEED"], inputs)
+                    text += "MACA_FA_PATH kernel=%s k=f32 v=f32 nb=75 kv=1024\n" % path_name
+                    text += "FLASH_ATTN_EXT(mock=1): OK\n1/1 tests passed\nBackend MACA0: OK\n"
+                elif log.stem.startswith("host-positive-") or log.stem.startswith("host-negative-"):
+                    op = command[command.index("-o") + 1]
+                    negative = log.stem.startswith("host-negative-")
+                    status = "FAIL" if negative else "OK"
+                    code = 1 if negative else 0
+                    text = "HOST_REFERENCE %s(mock=1) method=%s result=%s\n" % (op, run.HOST_METHODS[op], "FAIL" if negative else "PASS")
+                    text += "%s(mock=1): %s\n%d/1 tests passed\nBackend CPU: %s\n" % (op, status, 0 if negative else 1, status)
                 elif log.stem == "cpu-sum-oracle":
                     text = "".join("SUM(type=f32,ne=" + shape + ",permute=[1,0,2,3],oracle=integer_sum): OK\n"
                                    for shape in ("[33,256,1,1]", "[3,5,2,2]"))
@@ -171,9 +186,9 @@ class RunnerTests(unittest.TestCase):
                 elif log.stem == "ops-full":
                     text = "".join(op + "(mock=1): OK\n" for op in mock_ops)
                     text += "%d/%d tests passed\n  Backend MACA0: OK\n" % (len(mock_ops), len(mock_ops))
-                elif log.stem == "moe-duplicate-ids":
-                    text = "".join("MUL_MAT_ID(mock=%d,dup=1): OK\n" % i for i in range(16))
-                    text += "16/16 tests passed\n  Backend MACA0: OK\n"
+                    if flash_attn and fa_seed is not None:
+                        inputs = "".join("%d:0123456789abcdef:100;" % i for i in range(4))
+                        text += "FA_REPRO seed=%d case=mock=1 inputs=%s\n" % (fa_seed, inputs)
                 elif log.stem.startswith("ops-recovery-"):
                     op = log.stem[len("ops-recovery-"):].upper()
                     text = op + "(mock=1): OK\n  1/1 tests passed\n  Backend MACA0: OK\n"
@@ -183,6 +198,10 @@ class RunnerTests(unittest.TestCase):
                 elif log.stem.startswith("ops-"):
                     op = log.stem[len("ops-"):].upper()
                     text = op + "(mock=1): OK\n  1/1 tests passed\n  Backend MACA0: OK\n"
+                if host_reference and not log.stem.startswith("host-"):
+                    for op, method in run.HOST_METHODS.items():
+                        if op + "(mock=1): OK" in text:
+                            text += "HOST_REFERENCE %s(mock=1) method=%s result=PASS\n" % (op, method)
                 if log.stem == bad_step:
                     text = "FAILED: deliberate mock failure\n"
                     code = 0 if false_success else 1
@@ -203,11 +222,22 @@ class RunnerTests(unittest.TestCase):
                 argv.append("--full-ops")
             if flash_attn:
                 argv.append("--flash-attn")
+            if host_reference:
+                argv.append("--host-reference")
+            if fa_seed is not None:
+                argv += ["--fa-seed", str(fa_seed)]
+            if fa_replay:
+                argv.append("--fa-replay")
             if inventory:
                 manifest = path / "expected.json.gz"
                 data = {"base_commit": run.BASE_COMMIT, "device": "MACA0",
                         "flash_attention": flash_attn if manifest_flash is None else manifest_flash,
                         "cases": [[op, "mock=1", "OK"] for op in mock_ops]}
+                data["host_reference"] = host_reference if manifest_host is None else manifest_host
+                data["fa_replay_case"] = "mock=1"
+                if host_reference:
+                    data["host_reference_cases"] = [[op, "mock=1", method] for op, method in run.HOST_METHODS.items()]
+                    data["host_reference_controls"] = data["host_reference_cases"]
                 if manifest_op is not None:
                     data["cases"][0][0] = manifest_op
                 manifest.write_bytes(gzip.compress(json.dumps(data).encode()))
@@ -228,6 +258,155 @@ class RunnerTests(unittest.TestCase):
                         self.assertIn(saved_report.rsplit("/", 1)[0] + "/" + step["log"], members)
             return code, report, environments
 
+    def test_quantize_host_audit_success(self):
+        code, report, _ = self.simulate_run(mode="backend")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["quantize_host_reference"], {"accepted": True, "expected": 540, "gpu_test": False})
+
+    def test_quantize_host_audit_failure_does_not_stop_other_groups(self):
+        code, report, _ = self.simulate_run(mode="backend", full_ops=True, inventory=True,
+                                           bad_step="quantize-host-reference")
+        self.assertEqual(code, 1)
+        self.assertFalse(report["quantize_host_reference"]["accepted"])
+        self.assertTrue(report["exact_case_inventory"]["accepted"])
+
+    def test_quantize_host_audit_missing_marker_is_not_success(self):
+        code, report, _ = self.simulate_run(mode="backend", step_outputs={"quantize-host-reference": (0, "")})
+        self.assertEqual(code, 1)
+        self.assertFalse(report["quantize_host_reference"]["accepted"])
+
+    def test_quantize_host_audit_nonzero_with_marker_is_not_success(self):
+        text = "PASS quantizer host reference: 540/540; NOT a GPU test\n"
+        code, report, _ = self.simulate_run(mode="backend", step_outputs={"quantize-host-reference": (1, text)})
+        self.assertEqual(code, 1)
+        self.assertFalse(report["quantize_host_reference"]["accepted"])
+
+    def test_host_reference_success_and_provenance(self):
+        code, report, environments = self.simulate_run(mode="backend", full_ops=True, inventory=True, host_reference=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(report["host_reference_inventory"]["accepted"])
+        self.assertEqual(report["host_reference_inventory"]["observed_rows"], len(run.HOST_METHODS))
+        self.assertEqual(len(report["host_reference_controls"]), 2*len(run.HOST_METHODS))
+        self.assertTrue(all(x["accepted"] for x in report["host_reference_controls"]))
+        self.assertTrue(report["comparison_provenance"]["cpu_backend_support_unchanged"])
+        self.assertTrue(any(e.get("LLAMA_TEST_HOST_REFERENCE_FAULT") == "1" for e in environments))
+        self.assertNotIn("LLAMA_TEST_HOST_REFERENCE_FAULT", environments[-1])
+        self.assertEqual(environments[-1]["LLAMA_TEST_HOST_REFERENCE"], "1")
+
+    def test_host_reference_missing_marker_rejected(self):
+        text = "CPY(mock=1): OK\n1/1 tests passed\nBackend MACA0: OK\n"
+        code, report, _ = self.simulate_run(mode="backend", full_ops=True, inventory=True, host_reference=True,
+                                          step_outputs={"data-cpy": (0, text)})
+        self.assertEqual(code, 1)
+        self.assertFalse(report["data_regressions"]["CPY"]["accepted"])
+        self.assertTrue(report["default_ops_completed"])
+
+    def test_host_reference_positive_failure_continues(self):
+        code, report, environments = self.simulate_run(mode="backend", full_ops=True, inventory=True, host_reference=True,
+                                                      bad_steps={"host-positive-0-cpy": 1})
+        self.assertEqual(code, 1)
+        self.assertTrue(report["default_ops_completed"])
+        self.assertNotIn("LLAMA_TEST_HOST_REFERENCE_FAULT", environments[-1])
+
+    def test_host_reference_wrong_mode_rejected(self):
+        with self.assertRaises(SystemExit):
+            self.simulate_run(mode="backend", full_ops=True, inventory=True, host_reference=True, manifest_host=False)
+
+    def test_inherited_reference_flags_removed(self):
+        with patch.dict(os.environ, {"LLAMA_TEST_HOST_REFERENCE": "check", "LLAMA_TEST_HOST_REFERENCE_FAULT": "1"}):
+            _, _, environments = self.simulate_run(mode="backend")
+        self.assertTrue(all("LLAMA_TEST_HOST_REFERENCE" not in e and "LLAMA_TEST_HOST_REFERENCE_FAULT" not in e for e in environments))
+
+    def test_inherited_fa_debug_flags_removed(self):
+        flags = {"LLAMA_TEST_FA_SEED": "99", "GGML_MACA_FA_FORCE_F32": "1", "GGML_MACA_FA_DIAG": "1"}
+        with patch.dict(os.environ, flags):
+            _, _, environments = self.simulate_run(mode="backend")
+        self.assertTrue(all(all(key not in e for key in flags) for e in environments))
+
+    def test_fa_replay_runs_both_paths_and_all_seeds(self):
+        code, report, envs = self.simulate_run(mode="backend", full_ops=True, inventory=True,
+            flash_attn=True, fa_seed=7, fa_replay=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(report["fa_replay"]), 32)
+        self.assertTrue(all(item["accepted"] for item in report["fa_replay"]))
+        self.assertTrue(report["fa_full_replay_inputs_match"])
+        self.assertEqual({item["seed"] for item in report["fa_replay"]}, set(range(7, 23)))
+        self.assertTrue(all("GGML_MACA_FA_FORCE_F32" not in e for e in envs if "GGML_MACA_FA_DIAG" not in e))
+
+    def test_full_failure_not_hidden_by_fa_replay(self):
+        code, report, _ = self.simulate_run(mode="backend", full_ops=True, inventory=True,
+            flash_attn=True, fa_seed=7, fa_replay=True, bad_steps={"ops-full": 1, "fa-replay-00-tile": -6})
+        self.assertEqual(code, 1)
+        self.assertEqual(len(report["fa_replay"]), 32)
+        self.assertFalse(report["fa_replay"][0]["accepted"])
+        self.assertTrue(report["fa_replay"][-1]["accepted"])
+        self.assertFalse(report["requested_checks_passed"])
+
+    def test_fa_replay_mismatched_inputs_rejected(self):
+        inputs = "".join("%d:ffffffffffffffff:100;" % i for i in range(4))
+        text = "FA_REPRO seed=7 case=mock=1 inputs=" + inputs + "\nMACA_FA_PATH kernel=maca_f32\n"
+        text += "FLASH_ATTN_EXT(mock=1): OK\n1/1 tests passed\nBackend MACA0: OK\n"
+        code, report, _ = self.simulate_run(mode="backend", full_ops=True, inventory=True,
+            flash_attn=True, fa_seed=7, fa_replay=True, step_outputs={"fa-replay-00-f32": (0, text)})
+        self.assertEqual(code, 1)
+        self.assertTrue(any("fingerprints do not match" in item["reason"] for item in report["test_failures"]))
+
+    def test_invalid_fa_seed_rejected(self):
+        for seed in (-1, 2**64):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.simulate_run(mode="backend", flash_attn=True, fa_seed=seed)
+
+    def test_fa_full_isolated_input_mismatch_rejected(self):
+        inputs = "".join("%d:ffffffffffffffff:100;" % i for i in range(4))
+        text = "FA_REPRO seed=7 case=mock=1 inputs=" + inputs + "\n"
+        code, report, _ = self.simulate_run(mode="backend", full_ops=True, inventory=True,
+            flash_attn=True, fa_seed=7, fa_replay=True, step_outputs={"ops-full": (1, text)})
+        self.assertEqual(code, 1)
+        self.assertFalse(report["fa_full_replay_inputs_match"])
+        self.assertTrue(all(item["accepted"] for item in report["fa_replay"]))
+        self.assertTrue(any("full/isolated input fingerprints" in item["reason"] for item in report["test_failures"]))
+
+    def test_fa_replay_requires_seed_exact_case_hashes_and_path(self):
+        inputs = "".join("%d:0123456789abcdef:100;" % i for i in range(4))
+        text = ("FA_REPRO seed=7 case=mock=1 inputs=" + inputs + "\n"
+                "MACA_FA_PATH kernel=tile k=f32 v=f32 nb=75 kv=1024\n"
+                "FLASH_ATTN_EXT(mock=1): OK\n1/1 tests passed\nBackend MACA0: OK\n")
+        self.assertTrue(run.fa_replay_summary({"exit_code": 0}, text, "mock=1", 7, False)["accepted"])
+        self.assertTrue(run.fa_replay_summary({"exit_code": 0}, text.replace("kernel=tile", "kernel=maca_f32"),
+                                              "mock=1", 7, True)["accepted"])
+        for bad in (text.replace("seed=7", "seed=8"), text.replace("case=mock=1", "case=wrong"),
+                    text.replace("inputs=" + inputs, "inputs="), text.replace("kernel=tile", "kernel=maca_f32"),
+                    text.replace("1/1", "0/1"), text.replace("FLASH_ATTN_EXT(mock=1): OK", "FLASH_ATTN_EXT(mock=1): FAIL"),
+                    text + "FA_REPRO seed=7 case=mock=1 inputs=" + inputs + "\n"):
+            self.assertFalse(run.fa_replay_summary({"exit_code": 0}, bad, "mock=1", 7, False)["accepted"])
+        for code in (1, 124, -6, 127):
+            self.assertFalse(run.fa_replay_summary({"exit_code": code}, text, "mock=1", 7, False)["accepted"])
+
+    def test_reference_marker_exact_multiset(self):
+        case = ["CPY", "type=q8_0", "copy_bytes"]
+        line = "HOST_REFERENCE CPY(type=q8_0) method=copy_bytes result=PASS\n"
+        self.assertTrue(run.host_reference_summary(line, [case])["accepted"])
+        for text in ("", line * 2, line.replace("q8_0", "f32"), line.replace("PASS", "FAIL"), line.replace("copy_bytes", "other")):
+            self.assertFalse(run.host_reference_summary(text, [case])["accepted"])
+
+    def test_reference_negative_requires_numerical_failure(self):
+        case = ["CPY", "type=q8_0", "copy_bytes"]
+        text = ("HOST_REFERENCE CPY(type=q8_0) method=copy_bytes result=FAIL\n"
+                "CPY(type=q8_0): FAIL\n0/1 tests passed\nBackend CPU: FAIL\n")
+        self.assertTrue(run.reference_negative_accepted({"exit_code": 1}, text, case))
+        for code in (0, 2, -6, 124, 127, 134):
+            self.assertFalse(run.reference_negative_accepted({"exit_code": code}, text, case))
+        for bad in (text.replace("0/1 tests passed", ""), text.replace("type=q8_0", "type=f32"),
+                    text.replace("CPY(type=q8_0): FAIL", "CPY(type=q8_0): not supported [CPU]")):
+            self.assertFalse(run.reference_negative_accepted({"exit_code": 1}, bad, case))
+
+    def test_reference_negative_crash_continues_but_rejects(self):
+        code, report, _ = self.simulate_run(mode="backend", full_ops=True, inventory=True, host_reference=True,
+                                          bad_steps={"host-negative-cpy": -6})
+        self.assertEqual(code, 1)
+        self.assertTrue(report["default_ops_completed"])
+        self.assertFalse(report["host_reference_controls"][1]["accepted"])
+
     def test_flash_attention_candidate_enabled_and_checked(self):
         code, report, _ = self.simulate_run(mode="backend", full_ops=True, inventory=True, flash_attn=True)
         self.assertEqual(code, 0)
@@ -244,6 +423,18 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(report["flash_attention_enabled"])
         configure = next(item for item in report["steps"] if item["log"] == "configure-backend.log")
         self.assertIn("-DGGML_CUDA_FA=OFF", configure["command"])
+
+    def test_large_batch_failures_do_not_cancel_independent_groups(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, report, _ = self.simulate_run(mode="backend", full_ops=True, inventory=True, flash_attn=True,
+                bad_steps={"data-cpy": 1, "data-mul_mat": 134, "data-argsort": 124})
+        self.assertEqual(code, 1)
+        for op in ("CPY", "MUL_MAT", "ARGSORT"):
+            self.assertFalse(report["data_regressions"][op]["accepted"])
+        for op in ("MUL_MAT_ID", "FLASH_ATTN_EXT", "GET_ROWS"):
+            self.assertTrue(report["data_regressions"][op]["accepted"])
+        self.assertTrue(report["default_ops_completed"])
+        self.assertFalse(report["requested_checks_passed"])
 
     def test_flash_attention_inventory_mismatch_rejected(self):
         for enabled in (False, True):
@@ -394,9 +585,9 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(report["default_ops_completed"])
         self.assertFalse(report["operator_coverage_accepted"])
         self.assertTrue(all(item["accepted"] for item in report["layout_regressions"].values()))
-        self.assertTrue(report["moe_duplicate_ids"]["accepted"])
-        moe_command = next(item["command"] for item in report["steps"] if item["log"] == "moe-duplicate-ids.log")
-        self.assertEqual(moe_command[-4:], ["-o", "MUL_MAT_ID", "-p", r",dup=1$"])
+        self.assertFalse(report["moe_duplicate_ids"]["accepted"])
+        self.assertEqual(report["moe_duplicate_ids"]["status"], "not_run_upstream_undefined")
+        self.assertNotIn("moe-duplicate-ids.log", [item["log"] for item in report["steps"]])
         command = next(item["command"] for item in report["steps"] if item["log"] == "ops-full.log")
         self.assertNotIn("-o", command)
         self.assertNotIn("-p", command)
@@ -406,7 +597,7 @@ class RunnerTests(unittest.TestCase):
             code, report, _ = self.simulate_run(mode="backend", full_ops=True, bad_step="matmul-quant-layout", false_success=True)
         self.assertEqual(code, 1)
         self.assertFalse(report["layout_regressions"]["matmul-quant-layout"]["accepted"])
-        self.assertTrue(report["moe_duplicate_ids"]["accepted"])
+        self.assertFalse(report["moe_duplicate_ids"]["accepted"])
         self.assertTrue(report["default_ops_completed"])
 
     def test_failed_full_suite_cannot_be_hidden_by_smoke_pass(self):
@@ -418,10 +609,10 @@ class RunnerTests(unittest.TestCase):
 
     def test_failed_moe_regression_continues_full_suite(self):
         with contextlib.redirect_stderr(io.StringIO()):
-            code, report, _ = self.simulate_run(mode="backend", full_ops=True, bad_step="moe-duplicate-ids", false_success=True)
+            code, report, _ = self.simulate_run(mode="backend", full_ops=True, bad_step="data-mul_mat_id", false_success=True)
         self.assertEqual(code, 1)
         self.assertTrue(report["backend_smoke_completed"])
-        self.assertFalse(report["moe_duplicate_ids"]["accepted"])
+        self.assertFalse(report["data_regressions"]["MUL_MAT_ID"]["accepted"])
         self.assertTrue(report["default_ops_completed"])
 
     def test_full_summary_counts_all_names_and_rejects_abort(self):
@@ -474,6 +665,24 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(all(item["inventory"]["accepted"] for item in report["data_regressions"].values()))
         self.assertEqual(len(report["case_manifest_sha256"]), 64)
 
+    def test_historical_inventory_rejected_after_rebase(self):
+        manifest = Path(__file__).resolve().parent / "baselines/c500-ops-20261017.json.gz"
+        with gzip.open(manifest, "rt", encoding="utf-8") as source:
+            historical = json.load(source)
+        self.assertNotEqual(historical["base_commit"], run.BASE_COMMIT)
+        with tempfile.TemporaryDirectory() as temporary:
+            argv = ["run.py", "--build-dir", str(Path(temporary) / "build"),
+                    "--mode", "backend", "--full-ops", "--flash-attn", "--host-reference",
+                    "--case-manifest", str(manifest)]
+            with patch.object(sys, "argv", argv), patch.object(sys, "platform", "linux"), \
+                 patch("run.execute") as execute, contextlib.redirect_stderr(io.StringIO()) as errors:
+                with self.assertRaises(SystemExit) as raised:
+                    run.main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("Case inventory baseline or device does not match", errors.getvalue())
+            execute.assert_not_called()
+            self.assertFalse((Path(temporary) / "build").exists())
+
     def test_changed_case_rejected_despite_successful_counts(self):
         for stage in ("data-cpy", "ops-full"):
             with self.subTest(stage=stage), contextlib.redirect_stderr(io.StringIO()):
@@ -501,7 +710,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_multiple_failures_all_remain_in_report(self):
         failures = {"ops-add": 1, "data-sum": 1, "data-flash_attn_ext": -6,
-                    "matmul-original-layout": 124, "moe-duplicate-ids": 1}
+                    "matmul-original-layout": 124, "data-mul_mat_id": 1}
         code, report, _ = self.simulate_run(mode="backend", full_ops=True, inventory=True, flash_attn=True,
                                           bad_steps=failures)
         self.assertEqual(code, 1)

@@ -1,8 +1,51 @@
-# MACA v2 bring-up
+# MACA backend
 
-This development snapshot starts from upstream commit `8f574b0ad44c46d7b499ec028c29205aaa3fe80f` (2026-10-13). It adds an experimental `GGML_MACA` backend, disabled by default. The latest C500 run completed the full default operator suite with 20497 numerical comparisons passed and no numerical failures, but exact inventory acceptance is still blocked by 20 SET_ROWS cases that remain unsupported. This is a development checkpoint, not a fully supported backend or a performance release. Do not apply old branch acceptance counts to this snapshot.
+The `maca-backend` branch is rebased onto upstream commit `dd002b91f583af0b80140f9a140dc04856bfc2e0` (2026-10-20). It adds an experimental `GGML_MACA` backend, disabled by default. MACA compilation and C500 regression on this rebased source are pending; the historical results below do not validate this revision.
 
-## Current validation status (2026-10-14)
+The rebase keeps upstream's non-contiguous CPU SUM implementation and new regression cases. Upstream commit `8c2134a8755d8a9792af513dab20282affe903e4` marks duplicate expert IDs per token as undefined for MUL_MAT_ID and disables those tests. The runner no longer requires the old 16-case duplicate-ID group, records it as not run rather than passed, and still runs the independent MUL_MAT_ID group.
+
+The runner now records the new upstream baseline and rejects old case manifests. Keep the 2026-10-17 inventory unchanged as historical evidence. A new reviewed case inventory and C500 run are required before claiming exact coverage on this branch; changing the old manifest's commit field alone is not sufficient. Use a new build directory for the changed baseline.
+
+## Historical accepted operator baseline (2026-10-17)
+
+These results apply to upstream commit `8f574b0ad44c46d7b499ec028c29205aaa3fe80f` plus the MACA changes frozen in the tag below, not to the rebased branch.
+
+Version tag: `maca-v2-c500-ops-baseline-20261017`. Evidence: `maca-quant-rounding-vuf6o60t.tar.gz`, SHA-256 `558cc16d94a39a829031d853f7d3ae9b4ebfdbbacdef404df8beadf42e3a3c88`. The nested full run is `maca-v2-backend-run-cqd6gru4`. The audit checked 413 archive member hashes, 126 nested evidence files, all case identities and multiplicities, 2876 recorded source fingerprints and five SDK fingerprints. The evidence archive is retained separately, not embedded in Git.
+
+Configuration: one MetaX C500, MACA 3.2.0, cu-bridge API provider, hardware target `xcore1000`, Flash Attention enabled, Graph and operator fusion disabled. `GGML_MACA_QUANTIZE_FP_MODE=bridge` adds `--fmad=false` only to the MACA quantized-write translation unit. This is floating-point contraction control, not a global change to matrix multiplication or graph fusion.
+
+| Accepted evidence | Result |
+| --- | ---: |
+| Full fixed case inventory | 25041 / 25041 OK |
+| Failed / unsupported / skipped | 0 / 0 / 0 |
+| Comparisons with the CPU backend | 22033 |
+| Comparisons with test-only host references | 3008 |
+| Previous full-run failures now passing | 111 / 111 |
+| Fixed-input GPU quantization groups, byte-exact | 45 / 45 |
+| Host quantizer comparisons (not GPU tests) | 540 / 540 |
+| Host-reference positive / injected-fault controls | 42 / 8 |
+| FA tile / FP32 replays across 16 seeds | 32 / 32 |
+
+The independent operator groups also passed, including CPY (648), SET_ROWS (731) and FLASH_ATTN_EXT (5340). Their cases overlap the full inventory and must not be added to the 25041 total. The 65536 multiply-add probe samples match the host's separate-rounding result; all nine arithmetic fields match under their comparison policy, which excludes 2046 half NaN payload comparisons. IQ init/free helpers are internal, and the same-namespace executable no longer crashes in the control test.
+
+The exact reviewed inventory and machine-readable acceptance record are in `tests/maca/baselines/c500-ops-20261017.json.gz` and `tests/maca/baselines/c500-ops-20261017-acceptance.json`. To reproduce this historical result, use a separate checkout of tag `maca-v2-c500-ops-baseline-20261017`, then run from that checkout's source root:
+
+```sh
+python3 -B tests/maca/run.py \
+    --sdk /opt/maca-3.2.0 \
+    --build-dir ./build-maca-c500-ops \
+    --mode backend --device 0 --jobs 4 \
+    --full-ops --flash-attn --host-reference \
+    --fa-seed 20261016 --fa-replay --quantize-fp-mode bridge \
+    --case-manifest tests/maca/baselines/c500-ops-20261017.json.gz \
+    --build-timeout 7200 --run-timeout 14400
+```
+
+Reuse that source path and build directory for incremental builds. A checkout at a different path needs its own build directory. This command runs the operator, host-control and FA suites; the separate arithmetic, symbol and 45-group diagnostics are recorded in the returned rounding evidence. The retained `backend_accepted=false` and `operator_coverage_accepted=false` report fields do not grant broad backend acceptance; inspect `requested_checks_passed`, `full_operators` and `exact_case_inventory` for this scoped run.
+
+The 3008 host-reference comparisons do not add production CPU operator implementations. The 90 IQ2_XXS, IQ2_XS and IQ1_S cases use the explicitly approved all-ones importance policy, not calibrated imatrix quality. Untested shapes and operations, model inference and quality, performance, Graph/fusion, native-provider integration, other devices/SDKs and multi-GPU still require separate validation. No further local compilation or GPU tests were run while freezing this version. The historical sections below describe earlier candidates; this accepted baseline supersedes their pending counts, not their implementation limits.
+
+## Historical validation status (2026-10-14)
 
 Evidence: `maca-v2-backend-run-_mag605o.tar.gz`, SHA-256 `fc158e5a01e6ed7507419e956614a1a10f664750bf89c432eff1591a575c80d8`. All 2870 recorded source fingerprints matched the delivered candidate. The configuration is one MetaX C500, MACA 3.2.0, target `xcore1000`, generic Flash Attention enabled, Graph and fusion disabled.
 
@@ -197,3 +240,93 @@ The FA-on source prediction is 25005 records: 20517 OK, 1480 MACA-only unsupport
 `--full-ops` now runs an independent CPU-only SUM oracle check and complete GET_ROWS, ROPE, CONV_2D and LIGHTNING_INDEXER groups as well as the previous groups. A failed test group is recorded and independent groups continue. If the unfiltered full process aborts, missing groups are recovered separately; recovery never erases the failed full run. Configure/build/device prerequisites still stop unsafe execution, and user interruption stops the run. This continuation policy supersedes the earlier fail-fast description above.
 
 Use the new package's matching FA-on/off exact manifest. Every existing identity and multiplicity is preserved; exactly two oracle cases are added. Remaining work includes 1001 unsupported FA configurations, 288 SET_ROWS encoding cases, 76 CPY cases, 61 MUL_MAT cases, 14 MUL_MAT_ID cases, 24 long-row ARGSORT cases and 16 TQ GET_ROWS cases on the MACA-only list. Cases missing CPU implementations need independent reference tests before they can be accepted. Default-suite success still does not cover all GGML operations, untested layouts, models or devices.
+
+## Operator batch v3 candidate
+
+The last returned cu-bridge run (`_mag605o`) traversed 25005 records: 20497 OK, 1500 MACA-only unsupported, 1351 unsupported by both backends and 1657 CPU-only unsupported. There were no numerical failures, but 20 empty SET_ROWS views did not match the expected inventory, so that run was not fully accepted. Native runtime/API probes are separate evidence and do not establish operator support.
+
+This batch keeps the upstream revision, API provider and existing build directory. The following changes are MACA-only; other vendor dispatch and existing numerical tolerances are unchanged.
+
+- FLASH_ATTN_EXT: preserve the shared tile/vector paths. When no shared instance exists, pack Q/K/V on the GPU, use FP32 BLAS for both matrix products, and use a block-reduction softmax. The fallback handles different K/V head widths, GQA, masks, sinks, ALiBi and softcap. Its score temporary is limited to 64 MiB by chunking queries; packed Q/K/V storage is additional and can be large. This is a correctness fallback, not a fused attention kernel or a performance improvement.
+- TQ1_0/TQ2_0: add device conversion with the existing encoded block layout. GET_ROWS and matrix products reuse packed conversion and BLAS. Expert matrix multiplication keeps the existing per-expert grouping/scatter. These paths can allocate a full dequantized source temporary.
+- Q1_0/Q2_0/TQ1_0/TQ2_0: add reference-style block encoders for CPY and SET_ROWS, preserving explicit scale/rounding and packing rules. No existing quantizer is replaced. New CPY encoders require contiguous destinations; scalar inputs are packed as needed.
+- MUL_MAT_ID: honor explicit F32 source precision by using per-expert FP32 BLAS, avoiding conversion of large activations to F16. Default existing paths remain unchanged.
+- ARGSORT: retain shared-memory sorting for short rows. Long contiguous F32 rows use global-memory bitonic stages on one stream, with padded indices and row chunks. This requires many launches and is not a tuned radix sort. New support is bounded to 2^28 columns and INT_MAX elements; arbitrary layouts remain excluded.
+- SET_ROWS: a matched empty source/index view is a no-op. The output allocation is retained without packing or launching an empty kernel.
+
+The exact FA-on candidate inventory predicts 1260 newly comparable existing cases plus 36 added regression cases: 24 quantization boundary/layout cases, four long multi-row sorts covering both orders, and eight mismatched-head attention cases with large logits, ALiBi, sinks, softcap and permuted KV views. This predicts 25041 total records, 21793 OK and 3248 unsupported. These numbers are targets, not observed GPU results.
+
+There are still 240 MACA-only encoding cases for MXFP4, NVFP4, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K and IQ4_XS. The 3008 cases missing CPU references also remain unvalidated. This batch does not claim all operators are supported. Additional cases absent from the default test suite, models, Graph/fusion, performance, other devices and SDKs need separate acceptance.
+
+The runner adds full independent MUL_MAT, MUL_MAT_ID and ARGSORT groups before the full suite. Each independent group continues after another group fails, while configure/build/device failures still prevent stale-binary execution. Every case identity, status and duplicate multiplicity is checked against the supplied manifest. Unsupported is never counted as a numerical pass. Local host-model tests are not compiled GPU tests; C500 compilation and numerical regression are required before accepting this candidate.
+
+## Test-only host references
+
+The returned cu-bridge `run-taobwycj` matches the v3 source fingerprints and exact 25041-case inventory: 21793 OK, 240 MACA-only unsupported, 1351 unsupported by both backends, and 1657 CPU-only unsupported. A CPU-only unsupported record means the target advertised support but the comparison did not execute. It is not a numerical pass.
+
+The opt-in `tests/maca/run.py --host-reference` mode addresses those 1657 cases without changing GPU kernels or the CPU backend's capability declarations. It requires a matching reviewed case manifest. The original case identities, multiplicities and numerical tolerances are unchanged.
+
+| Group | Cases | Reference computation |
+| --- | ---: | --- |
+| CPY | 63 | Copy identical-type quantized blocks in logical tensor order; compare exact bytes |
+| OUT_PROD | 480 | Dequantize CPU-side inputs using GGML type traits; accumulate each dot product in FP64 with explicit batch broadcasting |
+| CONV_2D | 1114 | Pack the independent CPU-side kernel and input into contiguous tensors, preserving their scalar types; reuse the CPU convolution |
+
+The graph and its initialized data are copied to the CPU before target execution. CPU preprocessing nodes and reference outputs are computed from that independent copy. The target retains the original layouts. References must never consume target-computed intermediate results. This is test infrastructure, not a production CPU fallback and not a new native CPU implementation.
+
+The runner first compares the host methods against CPU-supported small cases and injects an error into each reference method in a separate negative-control process. A negative control is accepted only for the expected numerical test failure, never a crash, timeout or unsupported case. The normal test processes cannot inherit fault injection. Independent groups continue after a failed group; a failed control or full run still rejects acceptance.
+
+Each reference comparison prints a `HOST_REFERENCE` marker with its exact case, method and result. The runner verifies the full marker multiset separately from the normal test rows and records both comparison provenances. The unchanged default mode keeps CPU-unsupported cases unsupported. Manual test use is `LLAMA_TEST_HOST_REFERENCE=1`; `check` forces the reference on CPU-supported controls. `LLAMA_TEST_HOST_REFERENCE_FAULT` is only for negative controls and must not be set during normal validation.
+
+The target inventory is 23450 OK (21793 CPU-backend comparisons plus 1657 test-only host-reference comparisons) and 1591 unsupported (240 MACA-only plus 1351 both-unsupported). This is a prediction until C500 execution is returned and checked. Even a matching successful run does not establish all GGML operations, arbitrary shapes, models, other hardware, Graph/fusion, performance or the native API provider.
+
+### Host-reference context correction
+
+The returned `run-ig3_5qn5` matches the host-reference v1 source and manifest. Its independent CPY and OUT_PROD groups passed all 63 and 480 new host-reference comparisons respectively, including exact case/method markers. The CONV_2D reference crashed before any of its 1114 new comparisons completed; the full run is not accepted.
+
+The CONV_2D helper accidentally called the test class's sentinel-adding `ggml_new_tensor` wrapper twice. That created five tensors in a context budgeted for four, and also added temporary reference tensors to the tested graph's sentinel list. The correction explicitly calls `::ggml_new_tensor`, budgets exactly three tensors plus the graph, and asserts that the sentinel list is unchanged. Existing target-side sentinel checks, comparison tolerances, the 25041-case manifest, GPU kernels and backend capabilities are unchanged. The existing CPU convolution positive/negative controls reproduce this failure and must pass after rebuilding before full acceptance.
+
+## Mixed-input and FA reproducibility candidate (2026-10-16)
+
+The returned host-reference v2 full run traversed all 25041 cases: 23449 OK, one FA numerical failure and 1591 unsupported. Its independent FA group passed, and a subsequent diagnostic sampled the failing configuration and variants 35 times without reproducing it. These fresh random inputs do not clear the original full-run failure.
+
+This incremental candidate targets 1141 existing unsupported cases across four operators. It does not rebase, change the API provider, modify production CPU capabilities, or enable Graph/fusion.
+
+| Operator | Existing cases targeted | MACA execution / independent reference |
+| --- | ---: | --- |
+| MUL_MAT | 359 | Pack a mixed FP16 right operand to FP32 on-device; reuse BLAS and existing weight conversion. Preserve the FP16/FP16 path and MUL_MAT_ID restrictions. Test-only FP64 dot products handle batch broadcasting. |
+| OUT_PROD | 704 | Convert the FP16 right operand on-device, including transposed layouts; reuse FP32 BLAS. Extend the existing FP64 host oracle to read FP16 right operands. |
+| GET_ROWS_BACK | 54 | Convert BF16, quantized or I32 gradient inputs on-device; reuse the existing FP32 scatter-add equivalent. The host reference independently accumulates duplicate row IDs in FP64. Fix I32 test initialization so gradient data is not mistaken for row IDs. |
+| SOFT_MAX_BACK | 24 | Permit constant ALiBi bias with the existing backward formula, given the forward output. No mask/slope gradient is produced. Compare against an explicit FP64 formula. |
+
+Conversion may allocate a full FP32 temporary; these are correctness adapters, not performance claims. Support guards retain bounded indices, layouts, scalar types and shape constraints. Existing optimized paths outside these new combinations are unchanged. The source-derived target is **24591 OK and 450 unsupported**, not a hardware result. The remaining 450 cases are CPY (90) and SET_ROWS (360) quantized destination encoders: MXFP4, NVFP4, Q2_K through Q6_K, IQ4_XS, IQ2_XXS/XS/S, IQ3_XXS/S and IQ1_S/M. No host round-trip is advertised as GPU support for those encoders.
+
+FA diagnosis is separate from capability acceptance. `LLAMA_TEST_FA_SEED` enables per-case/tensor deterministic inputs in the FA tests; the unconfigured default remains random. `FA_REPRO` records the seed, exact case and FNV-1a fingerprints of logical input bytes. The large-logit variant also uses the seed; the sparse mask retains its existing fixed generator. Full tests and isolated reruns must match input fingerprints before their results can be compared. These new seeded inputs cannot reconstruct the original failed tensors, which were not saved.
+
+For MACA-only diagnostics, `GGML_MACA_FA_DIAG=1` prints the chosen kernel. `GGML_MACA_FA_FORCE_F32=1` selects the existing FP32 fallback when supported; without that explicit diagnostic override dispatch is unchanged. This is an A/B comparison, not the default fix for the unresolved tile failure. `tests/maca/run.py --fa-seed 20261016 --fa-replay` runs the full normal-dispatch suite, then 16 seeds on both tile and FP32 paths. It checks case identity, seed, input fingerprints, actual path, numerical result and process exit. Independent failures continue; successful reruns cannot erase a failed full run. Numerical tolerances are unchanged. Host reference controls include positive comparisons with existing CPU paths and a separate injected-fault negative control for each of six reference methods.
+
+Local Python, source-contract and packaging checks are not MACA compilation or C500 numerical acceptance. Return the hardware archive before accepting this candidate; model inference, performance, native provider, Graph/fusion and other devices remain separate gates.
+
+## Quantized write candidate (2026-10-16)
+
+The accepted `run-tnj7bn8a` covers 25041 fixed cases: 24591 OK, no numerical failures, and 450 unsupported. Its 2871 source fingerprints match the mixed-input candidate. The remaining inventory comprises 90 CPY and 360 SET_ROWS cases, not 450 distinct operators.
+
+This candidate adds MACA-only GPU block encoders for MXFP4, NVFP4, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S and IQ1_M. Each format accounts for 30 existing cases. CPY requires a contiguous quantized destination. SET_ROWS preserves index broadcasting, source/index views and empty-source no-op behavior. Scalar sources are packed to FP32 on the device. Existing read, matrix multiply and other vendor paths are not replaced.
+
+The private `ggml-maca/quantize-ref.cuh` scalar encoders and `quantize-tables.h` immutable codebook builders derive from the pinned upstream `ggml-quants.c`. Changes include device qualifiers, explicit table arguments, uint16 half storage, device half conversion, and a bounded insertion sort in place of IQ1's qsort. The IQ1 exhaustive-neighbour fallback indexes its eight-element input with the inner coordinate rather than the grid index, avoiding an upstream out-of-range access in that fallback. `generate_reference.py` and `reference-provenance.json` in the delivery package record the source and transformations. The upstream CPU encoder files remain unchanged.
+
+**Semantic extension:** IQ2_XXS, IQ2_XS and IQ1_S normally require an importance matrix. CPY and SET_ROWS do not accept one. With explicit user approval, MACA uses an all-ones importance vector for their 90 cases. The encoded block layout remains the existing GGML format, but this is not calibrated imatrix quantization and makes no model-quality claim. The test-only reference calls the upstream offline encoder with the same documented importance policy. This does not add production CPU operator support.
+
+The implementation is a correctness-first scalar-per-block GPU path, not a tuned parallel quantizer. Codebook initialization is host-only and independent of tensor values; tensor quantization stays on the GPU. Immutable host tables are uploaded to context-owned temporary buffers on the current stream for each invocation. Initialization, table uploads and per-thread local storage can be expensive; performance and Graph capture are not established.
+
+Acceptance keeps all 25041 case identities and numerical thresholds. The forecast is 25041 OK and zero unsupported, comprising 22033 CPU-backend comparisons and 3008 test-only host-reference comparisons. An additional host executable compares the scalar port with unchanged offline encoders on 540 deterministic zero, constant, tie and random patterns. It does not replace GPU verification. Forty-two CPU-backed positive controls and eight injected-fault negative controls check the reference methods; the existing FA replay and independent operator groups remain enabled. All counts are acceptance targets until the new hardware result archive is audited.
+
+## Quantized write rounding candidate (2026-10-16)
+
+The quant-write-v1 hardware run recorded 24930 OK and 111 failures, with no unsupported cases. The later diagnostic completed 45 groups after isolating its IQ helper namespace, but 27 groups still differed from the CPU reference. In its arithmetic probe, all 65536 GPU multiply-add outputs matched single-rounding FMA; the CPU outputs matched separate multiplication and addition, with 15956 differing samples. This identifies a rounding difference, not proof that every quantization failure has the same cause.
+
+`GGML_MACA_QUANTIZE_FP_MODE` applies contraction control to `ggml-maca/quantize.cu` only. `bridge` uses `--fmad=false`, `clang` uses `-ffp-contract=off`, and `clang-strict` also uses `-fno-fast-math`. The delivery runner tests these compiler interfaces on the installed SDK and selects only a mode with matching device arithmetic. An unsupported or ignored option is not accepted just because compilation succeeds. Other translation units, matrix multiplication, attention, CPU quantizers, numerical tolerances and the fixed case inventory are unchanged. Quantized write performance remains unmeasured.
+
+IQ codebook init/free helpers now have internal linkage, matching their file-local tables. This prevents an executable from interposing a helper while the backend reads a different table instance. Both isolated and same-namespace diagnostic executables are checked after rebuilding.
+
+The package reuses the existing incremental build and full operator runner, then collects all 45 fixed-input quantization groups independently. Arithmetic, symbol isolation and complete operator acceptance have separate result fields. Local compilation and tests were not run for this candidate at the user's request. Device acceptance, model tests and performance must not be inferred from packaging success.

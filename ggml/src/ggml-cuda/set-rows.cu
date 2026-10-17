@@ -260,7 +260,26 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
-    } else if (dst->type == GGML_TYPE_Q4_0) {
+    }
+#if defined(GGML_USE_MACA)
+    else if (ggml_maca_can_quantize_lowbit(dst->type)) {
+#define MACA_QUANT_SET_ROWS(TYPE, BLOCK, QK, FN) \
+        case TYPE: \
+            set_rows_cuda_quant<idx_t, BLOCK, QK, FN>(src0_d, src1_d, (BLOCK *) dst->data, \
+                ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, nb01, nb02, nb03, \
+                nb10, nb11, nb12, nb1, nb2, nb3, stream); \
+            break
+        switch (dst->type) {
+            MACA_QUANT_SET_ROWS(GGML_TYPE_Q1_0, block_q1_0, QK1_0, quantize_f32_q1_0_block);
+            MACA_QUANT_SET_ROWS(GGML_TYPE_Q2_0, block_q2_0, QK2_0, quantize_f32_q2_0_block);
+            MACA_QUANT_SET_ROWS(GGML_TYPE_TQ1_0, block_tq1_0, QK_K, quantize_f32_tq1_0_block);
+            MACA_QUANT_SET_ROWS(GGML_TYPE_TQ2_0, block_tq2_0, QK_K, quantize_f32_tq2_0_block);
+            default: GGML_ABORT("unsupported low-bit row update");
+        }
+#undef MACA_QUANT_SET_ROWS
+    }
+#endif
+    else if (dst->type == GGML_TYPE_Q4_0) {
         set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
             src0_d, src1_d, (block_q4_0*)dst->data,
             ne00, ne01, ne02, ne03,
@@ -377,10 +396,19 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
 
 
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_USE_MACA)
+    if (ggml_maca_can_quantize_extended(dst->type)) {
+        ggml_maca_quantize(ctx, dst->src[0], dst, dst->src[1]);
+        return;
+    }
+#endif
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
 #if defined(GGML_USE_MACA)
+    if (src0->ne[1] == 0 && src1->ne[0] == 0) {
+        return;
+    }
     ggml_cuda_pool_alloc<char> storage(ctx.pool());
     ggml_tensor packed;
     if (src0->type == GGML_TYPE_F16 && dst->type != GGML_TYPE_F16 &&

@@ -1,0 +1,83 @@
+{
+  "baseline_tag": "maca-v2-c500-ops-baseline-20261017",
+  "accepted_on": "2026-10-17",
+  "upstream_commit": "8f574b0ad44c46d7b499ec028c29205aaa3fe80f",
+  "acceptance_scope": "Fixed operator-case inventory, not full backend or model acceptance",
+  "evidence": {
+    "archive": "maca-quant-rounding-vuf6o60t.tar.gz",
+    "sha256": "558cc16d94a39a829031d853f7d3ae9b4ebfdbbacdef404df8beadf42e3a3c88",
+    "candidate_package": "maca-v2-quant-rounding-v1.tar.gz",
+    "candidate_sha256": "c1f3a78df125dbc6af99ccbcd87c2a9ab5753aeac4f9ac40ebcad28215a3b114",
+    "nested_full_run": "maca-v2-backend-run-cqd6gru4",
+    "archive_member_hashes_verified": 413,
+    "nested_evidence_files": 126,
+    "recorded_source_fingerprints_matched": 2876,
+    "recorded_sdk_fingerprints_matched": 5,
+    "note": "Recorded hashes match the delivered source; this is not independent binary attestation."
+  },
+  "case_manifest": {
+    "path": "tests/maca/baselines/c500-ops-20261017.json.gz",
+    "sha256": "158940ecd8bbdb760c37cbe678e5e1f63f426227b37a1aedb68a8da565f9b17a",
+    "exact_identities_and_multiplicities_matched": true
+  },
+  "configuration": {
+    "device": "MetaX C500",
+    "device_count": 1,
+    "sdk": "MACA 3.2.0",
+    "hardware_target": "xcore1000",
+    "api_provider": "cu-bridge",
+    "flash_attention": true,
+    "graph": false,
+    "operator_fusion": false,
+    "quantize_fp_mode": "bridge",
+    "quantize_translation_unit_option": "--fmad=false",
+    "fa_seed": 20261016
+  },
+  "results": {
+    "full_suite": {
+      "total": 25041,
+      "ok": 25041,
+      "failed": 0,
+      "unsupported": 0,
+      "skipped": 0,
+      "unparsed": 0,
+      "cpu_backend_comparisons": 22033,
+      "test_only_host_reference_comparisons": 3008
+    },
+    "previous_111_failures_now_passing": 111,
+    "fixed_input_gpu_quantization_groups_byte_exact": 45,
+    "host_quantizer_comparisons": 540,
+    "host_reference_positive_controls": 42,
+    "host_reference_injected_fault_controls": 8,
+    "fa_replays": 32,
+    "fa_distinct_seeds": 16,
+    "arithmetic_samples_per_field": 65536,
+    "arithmetic_fields": 9,
+    "arithmetic_differences_under_comparison_policy": 0,
+    "from_half_nan_payload_comparisons_excluded": 2046,
+    "iq_helpers_exported": false,
+    "same_namespace_control_passed": true,
+    "independent_groups_overlap_full_inventory": true
+  },
+  "semantic_extension": {
+    "formats": ["IQ2_XXS", "IQ2_XS", "IQ1_S"],
+    "cases": 90,
+    "importance_policy": "Explicitly authorized all-ones weights because CPY/SET_ROWS do not accept an imatrix",
+    "calibrated_quantization_quality_claimed": false
+  },
+  "not_established": [
+    "All possible shapes, layouts or GGML operations without tests",
+    "Production CPU implementation of the test-only reference cases",
+    "Model-level inference correctness or quantization quality",
+    "Performance",
+    "Graph capture or operator fusion",
+    "Full native API provider",
+    "Other devices, SDK versions or multi-GPU"
+  ],
+  "freeze": {
+    "additional_compilation_or_gpu_tests_run": false,
+    "native_experimental_edits_included": false,
+    "runtime_source_changes_since_hardware_evidence": false,
+    "line_ending_normalization_only": true
+  }
+}

@@ -3,12 +3,18 @@
 #include "../ggml-cuda/cpy.cuh"
 #include "../ggml-cuda/convert.cuh"
 #include "blas.cuh"
+#include "quantize.cuh"
 
 #include <limits>
 
+static inline bool ggml_maca_can_quantize_lowbit(ggml_type type) {
+    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0;
+}
+
 static inline bool ggml_maca_can_quantize(ggml_type type) {
     return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 ||
-           type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL;
+           type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ||
+           ggml_maca_can_quantize_lowbit(type);
 }
 
 static inline bool ggml_maca_copy_layout(const ggml_tensor * tensor, bool contiguous_rows = true) {
@@ -36,7 +42,7 @@ static inline bool ggml_maca_copy_layout(const ggml_tensor * tensor, bool contig
     return elements / block_size <= limit / type_size;
 }
 
-static inline bool ggml_maca_can_copy_f32(const ggml_tensor * src) {
+static inline bool ggml_maca_can_copy_f32(const ggml_tensor * src, bool allow_i32 = false) {
     if (!ggml_maca_copy_layout(src, false)) {
         return false;
     }
@@ -44,7 +50,7 @@ static inline bool ggml_maca_can_copy_f32(const ggml_tensor * src) {
         return false;
     }
     // Some shared conversion kernels use 32-bit element indices.
-    return (src->type == GGML_TYPE_F32 || ggml_get_to_fp32_cuda(src->type) != nullptr) &&
+    return (src->type == GGML_TYPE_F32 || (allow_i32 && src->type == GGML_TYPE_I32) || ggml_get_to_fp32_cuda(src->type) != nullptr) &&
            ggml_nelements(src) <= std::numeric_limits<int>::max() - CUDA_CPY_BLOCK_SIZE;
 }
 
@@ -64,7 +70,7 @@ static inline ggml_tensor ggml_maca_pack_scalar(ggml_backend_cuda_context & ctx,
 }
 
 static inline ggml_tensor ggml_maca_copy_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_cuda_pool_alloc<char> & storage) {
-    GGML_ASSERT(ggml_maca_can_copy_f32(src));
+    GGML_ASSERT(ggml_maca_can_copy_f32(src, true));
     ggml_tensor packed = *src;
     packed.type = GGML_TYPE_F32;
     size_t bytes = sizeof(float);

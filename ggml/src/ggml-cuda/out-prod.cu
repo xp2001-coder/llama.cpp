@@ -32,11 +32,15 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src1 = dst->src[1];
 
 #if defined(GGML_USE_MACA)
-    ggml_cuda_pool_alloc<char> storage(ctx.pool());
-    ggml_tensor packed;
+    ggml_cuda_pool_alloc<char> storage(ctx.pool()), rhs_storage(ctx.pool());
+    ggml_tensor packed, rhs_packed;
     if (src0->type != GGML_TYPE_F32) {
         packed = ggml_maca_copy_f32(ctx, src0, storage);
         src0 = &packed;
+    }
+    if (src1->type == GGML_TYPE_F16) {
+        rhs_packed = ggml_maca_copy_f32(ctx, src1, rhs_storage);
+        src1 = &rhs_packed;
     }
 #endif
 

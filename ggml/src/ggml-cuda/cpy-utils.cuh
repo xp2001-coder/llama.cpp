@@ -3,6 +3,85 @@
 #include "ggml-common.h"
 #include "convert.cuh"
 
+#if defined(GGML_USE_MACA)
+// Match the reference block encodings in ggml-quants.c, including rounding.
+static __device__ void quantize_f32_q1_0_block(const float * x, block_q1_0 * y) {
+    float sum = 0.0f;
+    for (int j = 0; j < QK1_0; ++j) {
+        sum = __fadd_rn(sum, fabsf(x[j]));
+    }
+    y->d = __float2half_rn(__fdiv_rn(sum, float(QK1_0)));
+    for (int j = 0; j < QK1_0 / 8; ++j) {
+        uint8_t bits = 0;
+        for (int b = 0; b < 8; ++b) {
+            bits |= uint8_t(x[8 * j + b] >= 0.0f) << b;
+        }
+        y->qs[j] = bits;
+    }
+}
+
+static __device__ void quantize_f32_q2_0_block(const float * x, block_q2_0 * y) {
+    float maximum = 0.0f;
+    for (int j = 0; j < QK2_0; ++j) {
+        maximum = fmaxf(maximum, fabsf(x[j]));
+    }
+    const float inverse = maximum > 0.0f ? __fdiv_rn(1.0f, maximum) : 0.0f;
+    y->d = __float2half_rn(maximum);
+    for (int j = 0; j < QK2_0 / 4; ++j) {
+        uint8_t bits = 0;
+        for (int b = 0; b < 4; ++b) {
+            const int value = int(roundf(__fmul_rn(x[4 * j + b], inverse))) + 1;
+            bits |= min(3, max(0, value)) << (2 * b);
+        }
+        y->qs[j] = bits;
+    }
+}
+
+static __device__ void quantize_f32_tq1_0_block(const float * x, block_tq1_0 * y) {
+    static_assert(QK_K == 256, "ternary block layout");
+    float maximum = 0.0f;
+    for (int j = 0; j < QK_K; ++j) {
+        maximum = fmaxf(maximum, fabsf(x[j]));
+    }
+    const float inverse = maximum > 0.0f ? __fdiv_rn(1.0f, maximum) : 0.0f;
+    y->d = __float2half_rn(maximum);
+    for (int j = 0; j < 48; ++j) {
+        const int width = j < 32 ? 32 : 16;
+        const int start = j < 32 ? j : 160 + j - 32;
+        uint16_t code = 0;
+        for (int digit = 0; digit < 5; ++digit) {
+            code = code * 3 + int(roundf(__fmul_rn(x[start + digit * width], inverse))) + 1;
+        }
+        y->qs[j] = (code * 256 + 242) / 243;
+    }
+    for (int j = 0; j < 4; ++j) {
+        uint16_t code = 0;
+        for (int digit = 0; digit < 4; ++digit) {
+            code = code * 3 + int(roundf(__fmul_rn(x[240 + j + digit * 4], inverse))) + 1;
+        }
+        y->qh[j] = (code * 3 * 256 + 242) / 243;
+    }
+}
+
+static __device__ void quantize_f32_tq2_0_block(const float * x, block_tq2_0 * y) {
+    float maximum = 0.0f;
+    for (int j = 0; j < QK_K; ++j) {
+        maximum = fmaxf(maximum, fabsf(x[j]));
+    }
+    const float inverse = maximum > 0.0f ? __fdiv_rn(1.0f, maximum) : 0.0f;
+    y->d = __float2half_rn(maximum);
+    for (int j = 0; j < QK_K / 4; ++j) {
+        uint8_t bits = 0;
+        for (int digit = 0; digit < 4; ++digit) {
+            const int col = (j / 32) * 128 + j % 32 + digit * 32;
+            const int value = int(roundf(__fmul_rn(x[col], inverse))) + 1;
+            bits |= (value & 3) << (2 * digit);
+        }
+        y->qs[j] = bits;
+    }
+}
+#endif
+
 static __device__ __forceinline__ int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
     if (x >= val[n-1]) return n-1;
