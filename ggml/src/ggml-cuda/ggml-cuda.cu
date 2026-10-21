@@ -2539,6 +2539,16 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_pool1d(ctx, dst);
             break;
         case GGML_OP_SUM:
+#if defined(GGML_USE_MACA)
+            if (!ggml_is_contiguously_allocated(dst->src[0])) {
+                ggml_cuda_pool_alloc<char> storage(ctx.pool());
+                ggml_tensor packed = ggml_maca_pack_scalar(ctx, dst->src[0], storage);
+                ggml_tensor result = *dst;
+                result.src[0] = &packed;
+                ggml_cuda_op_sum(ctx, &result);
+                break;
+            }
+#endif
             ggml_cuda_op_sum(ctx, dst);
             break;
         case GGML_OP_CUMSUM:
@@ -5643,7 +5653,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                     }
                     if (op->src[0]->type == GGML_TYPE_F16 && ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU_OAI) {
+#if defined(GGML_USE_MACA)
+                        const ggml_tensor * a = op->src[0];
+                        const ggml_tensor * b = op->src[1];
+                        return op->type == GGML_TYPE_F16 && ggml_is_contiguous(op) &&
+                               ggml_is_contiguous_1(a) && a->nb[0] == sizeof(half) &&
+                               op->ne[0] == (b ? a->ne[0] : a->ne[0] / 2) &&
+                               (b || a->ne[0] % 2 == 0) && ggml_nrows(op) == ggml_nrows(a) &&
+                               (!b || (b->type == a->type && ggml_are_same_shape(a, b) &&
+                                       ggml_is_contiguous_1(b) && b->nb[0] == sizeof(half)));
+#else
                         return false;
+#endif
                     }
                     return ggml_is_contiguous_1(op->src[0]);
                 default:
@@ -6198,7 +6219,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUM:
 #if defined(GGML_USE_MACA)
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
-                   ggml_maca_copy_layout(op->src[0], false) && ggml_is_contiguously_allocated(op->src[0]) &&
+                   ggml_maca_copy_layout(op->src[0], false) &&
                    ggml_nelements(op->src[0]) <= INT_MAX - 8 * 512;
 #else
             return ggml_is_contiguously_allocated(op->src[0]);

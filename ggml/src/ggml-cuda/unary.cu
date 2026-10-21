@@ -451,8 +451,11 @@ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     GGML_ASSERT(src0->nb[0] == ggml_element_size(src0));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
+#if defined(GGML_USE_MACA)
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+#else
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+#endif
     GGML_ASSERT(src0->type == dst->type);
     GGML_ASSERT(dst->ne[0] == nc);
     GGML_ASSERT(ggml_nrows(dst) == ggml_nrows(src0));
@@ -468,6 +471,20 @@ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
     const float alpha = ggml_get_op_params_f32(dst, 2);
     const float limit = ggml_get_op_params_f32(dst, 3);
+
+#if defined(GGML_USE_MACA)
+    if (src0->type == GGML_TYPE_F16) {
+        half * src0_p = (half *) src0_d;
+        half * src1_p = (half *) src1_d;
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+        swiglu_oai_cuda(src0_p, src1_p, (half *) dst_d, ggml_nelements(dst), nc,
+                        src0_o / sizeof(half), src1_o / sizeof(half), alpha, limit, stream);
+        return;
+    }
+#endif
 
     float * src0_p = (float *) src0_d;
     float * src1_p = (float *) src1_d;
